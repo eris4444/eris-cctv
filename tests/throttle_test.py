@@ -241,6 +241,20 @@ async def main():
     init, frags = await watch_for(OLD_SERVER_PORT, view, ocookie, 8)
     check(init and frags >= 4, "video flows (%d fragments)" % frags)
 
+    print("C2: that server is updated (TLS on the same port) while the camera stays connected")
+    old_server._stop.set()
+    await asyncio.wait_for(tasks.pop(), 10)
+    updated = server_mod.Server()
+    updated.cfg.update({"port": OLD_SERVER_PORT, "bind": "127.0.0.1"})
+    tasks.append(asyncio.ensure_future(updated.run()))
+    t = time.monotonic()
+    end = t + 30
+    while time.monotonic() < end and not (link.state == "connected" and link.secure):
+        await asyncio.sleep(0.2)
+    check(link.state == "connected" and link.secure,
+          "camera switched to TLS by itself after %.1fs" % (time.monotonic() - t))
+    old_server = updated
+
     print("D: TLS on a link much slower than the camera (8 KB/s)")
     net.tls_rate = 8000
     link = await relink(agent, tls_mode="auto", port=PROXY_PORT)

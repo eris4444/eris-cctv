@@ -207,6 +207,9 @@ upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webca
 
 ## Changes
 
+- **1.1.1** - A camera system that fell back to an unencrypted link (server still on 1.0) switches to
+  TLS within seconds once that server is updated - update the camera systems and the server in any
+  order.
 - **1.1.0** - The camera -> server link is encrypted automatically: the server serves TLS and plain
   HTTP on the same port with a self-signed certificate it creates itself, camera systems use TLS
   whenever it is offered (fixes "Starting video..." on networks that throttle unencrypted uploads).

@@ -32,6 +32,10 @@ class AuthError(Exception):
     pass
 
 
+class Reconnect(Exception):
+    """End the session and connect again right away (e.g. to switch to TLS)."""
+
+
 def cert_fingerprint(der: bytes) -> str:
     return hashlib.sha256(der).hexdigest()
 
@@ -252,9 +256,14 @@ class ServerLink:
             self.state = "connecting"
             self.last_attempt = time.time()
             self.connected_since = 0.0
+            delay = None
             try:
                 await self._session()
                 backoff = 3
+            except Reconnect as e:
+                self.state, self.error = "connecting", ""
+                log.info("server %s:%s: %s", self.cfg["address"], self.cfg["port"], e)
+                delay = 1
             except AuthError as e:
                 self.state, self.error = "error", str(e)
                 log.warning("server %s:%s: %s", self.cfg["address"], self.cfg["port"], e)
@@ -269,10 +278,12 @@ class ServerLink:
                 if self.ws:
                     self.ws.abort()
                     self.ws = None
-            if self.connected_since and backoff < 60:
-                backoff = 2  # the link was up: come back quickly, viewers are probably waiting
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            if delay is None:
+                if self.connected_since and backoff < 60:
+                    backoff = 2  # the link was up: come back quickly, viewers are probably waiting
+                delay = backoff
+                backoff = min(backoff * 2, 60)
+            await asyncio.sleep(delay)
 
     def _detach(self) -> None:
         for cam in self.agent.cameras.values():
@@ -283,7 +294,8 @@ class ServerLink:
         self._queued = 0
 
     async def _session(self) -> None:
-        ws, fp, secure = await open_ws(self.cfg, plain_first=time.monotonic() < self._plain_until)
+        plain_first = time.monotonic() < self._plain_until
+        ws, fp, secure = await open_ws(self.cfg, plain_first=plain_first)
         self.ws, self.secure = ws, secure
         if not secure and tls_mode(self.cfg) == "auto":
             self._plain_until = time.monotonic() + PLAIN_RETRY_TLS
@@ -292,8 +304,11 @@ class ServerLink:
             self.cfg["tls_pin"] = fp  # trust on first use, only after the server proved the password
             self.agent.save()
         self.server_tls = bool(welcome.get("tls")) or secure
-        if self.server_tls and not secure:
-            self._plain_until = 0.0  # the server offers TLS now: use it from the next connection on
+        if self.server_tls and not secure and tls_mode(self.cfg) == "auto":
+            self._plain_until = 0.0
+            if plain_first:
+                # TLS was skipped because this server had none before - it was updated: switch now
+                raise Reconnect("the server offers TLS now - reconnecting encrypted")
         self.server_name = welcome.get("server_name", "")
         self.state, self.error = "connected", ""
         self.connected_since = time.time()
