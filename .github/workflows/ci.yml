@@ -18,8 +18,8 @@ jobs:
           - os: ubuntu-24.04
             python: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install ffmpeg
@@ -39,7 +39,7 @@ jobs:
     name: Real install (systemd, TLS, update, uninstall)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install as a server (self-signed TLS)
         run: |
           sudo ERIS_CCTV_SRC="$GITHUB_WORKSPACE" bash install.sh setup-server --port 8800 \
@@ -80,20 +80,30 @@ jobs:
     name: Simulated USB webcam (v4l2loopback) + ALSA microphone
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Kernel modules
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg alsa-utils "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" v4l2loopback-dkms
-          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="CI Webcam" exclusive_caps=1
-          sudo modprobe snd-aloop
-          ls -l /dev/video* ; cat /proc/asound/cards
+          sudo apt-get install -y -qq ffmpeg alsa-utils build-essential "linux-headers-$(uname -r)"
+          if apt-cache show "linux-modules-extra-$(uname -r)" >/dev/null 2>&1; then
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+          fi
+          uname -r
+          modinfo -n videodev snd-aloop || true
+          git clone --depth 1 https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
+          make -C /tmp/v4l2loopback v4l2loopback.ko
+          sudo modprobe videodev
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=1 video_nr=10 card_label="CI Webcam" exclusive_caps=1
+          if sudo modprobe snd-aloop; then echo "AUDIO=1" >> "$GITHUB_ENV"; else echo "snd-aloop not available: video only"; fi
+          ls -l /dev/video* ; cat /proc/asound/cards || true
       - name: Feed the fake webcam and microphone
         run: |
           sudo nohup ffmpeg -nostdin -loglevel error -re -f lavfi -i testsrc2=size=1280x720:rate=15 \
             -pix_fmt yuyv422 -f v4l2 /dev/video10 > /tmp/feed-video.log 2>&1 &
-          sudo nohup ffmpeg -nostdin -loglevel error -re -f lavfi -i sine=frequency=440:sample_rate=48000 \
-            -ac 2 -f alsa hw:Loopback,0,0 > /tmp/feed-audio.log 2>&1 &
+          if [ "${AUDIO:-}" = 1 ]; then
+            sudo nohup ffmpeg -nostdin -loglevel error -re -f lavfi -i sine=frequency=440:sample_rate=48000 \
+              -ac 2 -f alsa hw:Loopback,0,0 > /tmp/feed-audio.log 2>&1 &
+          fi
           sleep 3
       - name: Install server + camera using the V4L2 device
         run: |
@@ -103,6 +113,7 @@ jobs:
           sudo eris-cctv setup-camera --cameras 1 --panel-password panelpass \
             --server 127.0.0.1:8800 --server-user cam --server-password campass1
       - name: Attach the ALSA loopback microphone through the panel API
+        if: env.AUDIO == '1'
         run: |
           python3 - <<'EOF'
           import json, urllib.request
@@ -125,7 +136,7 @@ jobs:
       - name: Check
         run: |
           python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1 \
-            --agent http://127.0.0.1:8090 --agent-password panelpass --audio
+            --agent http://127.0.0.1:8090 --agent-password panelpass ${AUDIO:+--audio}
       - name: Logs
         if: always()
         run: |
