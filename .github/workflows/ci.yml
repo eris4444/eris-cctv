@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: ubuntu-24.04
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+      - name: Compile
+        run: python -m compileall -q eriscctv tests run.py
+      - name: Check panel JavaScript
+        run: for f in eriscctv/static/*/*.js; do node --check "$f"; done
+      - name: Check install.sh
+        run: bash -n install.sh
+      - name: End-to-end test (server + camera + viewers + recording)
+        run: python tests/e2e_test.py
+      - name: Setup wizard test
+        run: python tests/wizard_test.py
+
+  install:
+    name: Real install (systemd, TLS, update, uninstall)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install as a server (self-signed TLS)
+        run: |
+          sudo ERIS_CCTV_SRC="$GITHUB_WORKSPACE" bash install.sh setup-server --port 8800 \
+            --camera-user cam --camera-password campass1 --admin-user admin --admin-password adminpass1 \
+            --address 127.0.0.1 --tls self-signed
+      - name: Set up the same machine as a camera (test pattern + test tone)
+        run: |
+          sudo eris-cctv setup-camera --cameras test --audio yes --panel-password panelpass \
+            --server 127.0.0.1:8800 --server-user cam --server-password campass1 --server-tls \
+            --record-path /var/lib/eris-cctv/rec
+      - name: Check through the panels
+        run: |
+          python3 tests/ci_check.py --server https://127.0.0.1:8800 --password adminpass1 \
+            --agent http://127.0.0.1:8090 --agent-password panelpass --audio --recordings
+      - name: Status
+        run: |
+          sudo eris-cctv status
+          systemctl status eris-cctv-agent eris-cctv-server --no-pager
+          sudo grep -o '"tls_pin": "[0-9a-f]*"' /etc/eris-cctv/agent.json
+      - name: Update from GitHub
+        if: github.ref == 'refs/heads/main'
+        run: |
+          sudo eris-cctv update
+          sleep 5
+          python3 tests/ci_check.py --server https://127.0.0.1:8800 --password adminpass1
+      - name: Uninstall
+        run: |
+          printf 'y\nn\nn\n' | sudo eris-cctv uninstall
+          ! systemctl is-active eris-cctv-agent
+          ! test -e /usr/local/bin/eris-cctv
+      - name: Logs
+        if: always()
+        run: |
+          sudo journalctl -u eris-cctv-agent -u eris-cctv-server --no-pager | tail -n 150 || true
+          sudo tail -n 150 /var/log/eris-cctv/*.log || true
+
+  webcam:
+    name: Simulated USB webcam (v4l2loopback) + ALSA microphone
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel modules
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg alsa-utils "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" v4l2loopback-dkms
+          sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="CI Webcam" exclusive_caps=1
+          sudo modprobe snd-aloop
+          ls -l /dev/video* ; cat /proc/asound/cards
+      - name: Feed the fake webcam and microphone
+        run: |
+          sudo nohup ffmpeg -nostdin -loglevel error -re -f lavfi -i testsrc2=size=1280x720:rate=15 \
+            -pix_fmt yuyv422 -f v4l2 /dev/video10 > /tmp/feed-video.log 2>&1 &
+          sudo nohup ffmpeg -nostdin -loglevel error -re -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -ac 2 -f alsa hw:Loopback,0,0 > /tmp/feed-audio.log 2>&1 &
+          sleep 3
+      - name: Install server + camera using the V4L2 device
+        run: |
+          sudo ERIS_CCTV_SRC="$GITHUB_WORKSPACE" bash install.sh setup-server --port 8800 \
+            --camera-user cam --camera-password campass1 --admin-user admin --admin-password adminpass1 --address 127.0.0.1
+          sudo eris-cctv devices
+          sudo eris-cctv setup-camera --cameras 1 --panel-password panelpass \
+            --server 127.0.0.1:8800 --server-user cam --server-password campass1
+      - name: Attach the ALSA loopback microphone through the panel API
+        run: |
+          python3 - <<'EOF'
+          import json, urllib.request
+          base = "http://127.0.0.1:8090"
+          def call(m, p, b=None, ck=""):
+              r = urllib.request.Request(base + p, method=m, data=json.dumps(b).encode() if b is not None else None,
+                                         headers={"X-Requested-With": "eris-cctv", "Content-Type": "application/json", "Cookie": ck})
+              with urllib.request.urlopen(r, timeout=30) as x:
+                  return json.loads(x.read() or b"{}"), (x.headers.get("Set-Cookie") or "").split(";")[0]
+          _, ck = call("POST", "/api/login", {"username": "admin", "password": "panelpass"})
+          devs, _ = call("GET", "/api/devices", ck=ck)
+          print(json.dumps(devs, indent=1))
+          mic = [a for a in devs["audio"] if "Loopback" in a["path"] and a["path"].endswith("DEV=1")][0]
+          st, _ = call("GET", "/api/status", ck=ck)
+          cam = st["cameras"][0]
+          print("camera:", cam["device"], "modes:", cam.get("modes"))
+          call("PUT", "/api/cameras/" + cam["id"], {"audio": mic["key"]}, ck=ck)
+          print("microphone attached:", mic["key"])
+          EOF
+      - name: Check
+        run: |
+          python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1 \
+            --agent http://127.0.0.1:8090 --agent-password panelpass --audio
+      - name: Logs
+        if: always()
+        run: |
+          cat /tmp/feed-video.log /tmp/feed-audio.log || true
+          sudo tail -n 200 /var/log/eris-cctv/*.log || true
