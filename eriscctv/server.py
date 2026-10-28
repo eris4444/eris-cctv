@@ -9,11 +9,10 @@ import logging
 import re
 import secrets
 import signal
-import ssl
 import struct
 import time
 
-from . import __version__
+from . import __version__, certs
 from .auth import ITERATIONS, Throttle, check_secret, make_secret, proof, same
 from .panel import PanelAuth, need_admin, need_login
 from .util import (IS_WINDOWS, config_path, data_path, load_json, log_tail, new_id, remove_pid, save_json,
@@ -30,27 +29,26 @@ USER_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,40}$")
 
 def default_config() -> dict:
     return {"server_id": new_id(8), "name": "Eris CCTV Server", "port": DEFAULT_PORT, "bind": "0.0.0.0",
-            "public_address": "", "tls": {"enabled": False, "cert": "", "key": ""},
+            "public_address": "", "tls": {"mode": "auto", "cert": "", "key": ""},
             "camera_accounts": [], "users": [], "fake_salt_key": secrets.token_hex(16)}
+
+
+TLS_MODES = ("auto", "files", "off")
 
 
 def load_config(path: str = "") -> dict:
     cfg = load_json(path or config_path("server")) or default_config()
     for k, v in default_config().items():
         cfg.setdefault(k, v)
+    tls = cfg["tls"] if isinstance(cfg.get("tls"), dict) else {}
+    if tls.get("mode") not in TLS_MODES:
+        # 1.0 had {"enabled": bool}: "off" there meant "no certificate yet", so it becomes automatic
+        tls["mode"] = "files" if tls.get("enabled") and tls.get("cert") and tls.get("key") else "auto"
+    tls.pop("enabled", None)
+    tls.setdefault("cert", "")
+    tls.setdefault("key", "")
+    cfg["tls"] = tls
     return cfg
-
-
-def cert_fingerprint_file(path: str) -> str:
-    try:
-        with open(path, encoding="ascii", errors="ignore") as f:
-            pem = f.read()
-        m = re.search(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", pem, re.S)
-        if not m:
-            return ""
-        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(m.group(0))).hexdigest()
-    except (OSError, ValueError):
-        return ""
 
 
 def valid_user(name: str) -> str:
@@ -97,19 +95,30 @@ class Viewer:
 
 
 class AgentConn:
-    def __init__(self, sock, agent_id, name, account, ip, version):
+    def __init__(self, sock, agent_id, name, account, ip, version, secure=False):
         self.sock = sock
         self.agent_id = agent_id
         self.name = name
         self.account = account
         self.ip = ip
         self.version = version
+        self.secure = secure
         self.connected_at = time.time()
         self.cams: dict = {}      # slot -> camera info
         self.by_id: dict = {}     # camera id -> slot
         self.inits: dict = {}     # slot -> init segment
         self.subscribed = set()   # slots the agent is streaming to us
         self.bytes_in = 0
+        self._rate = (time.monotonic(), 0, 0)  # (time, bytes_in, bytes/s) of the last sample
+
+    def rate_in(self) -> int:
+        """Incoming bytes per second, sampled whenever the panel asks."""
+        t0, b0, rate = self._rate
+        now = time.monotonic()
+        if now - t0 >= 1:
+            rate = int((self.bytes_in - b0) / (now - t0))
+            self._rate = (now, self.bytes_in, rate)
+        return rate
 
 
 class Server:
@@ -124,6 +133,7 @@ class Server:
         self.web = HttpServer("eris-cctv-server")
         self.agent_throttle = Throttle(limit=10, window=600, block=600)
         self.started = time.time()
+        self.tls_cert = ""        # certificate in use ("" = camera connections cannot use TLS)
         self._save_pending = False
         self._stop = None
         self.auth = PanelAuth(self.web, "ecctv_srv", self._verify, "server")
@@ -184,11 +194,18 @@ class Server:
                     loop.add_signal_handler(sig, self._stop.set)
                 except (NotImplementedError, RuntimeError):
                     pass
-        tls = self.cfg.get("tls") or {}
-        ctx = make_server_ssl(tls["cert"], tls["key"]) if tls.get("enabled") else None
-        await self.web.start(self.cfg.get("bind", "0.0.0.0"), int(self.cfg.get("port", DEFAULT_PORT)), ctx)
-        log.info("Eris CCTV server %s listening on %s://%s:%s", __version__, "https" if ctx else "http",
-                 self.cfg.get("bind"), self.cfg.get("port"))
+        cert, key = self.tls_files()
+        ctx = None
+        if cert:
+            try:
+                ctx = make_server_ssl(cert, key)
+                self.tls_cert = cert
+            except (OSError, ValueError) as e:
+                log.error("cannot load the TLS certificate %s: %s", cert, e)
+        await self.web.start(self.cfg.get("bind", "0.0.0.0"), int(self.cfg.get("port", DEFAULT_PORT)), ctx,
+                             also_plain=True)
+        log.info("Eris CCTV server %s listening on port %s (%s)", __version__, self.cfg.get("port"),
+                 "http + https/TLS on the same port" if ctx else "http only - camera connections are NOT encrypted")
         write_pid("server")
         try:
             await self._stop.wait()
@@ -198,6 +215,26 @@ class Server:
             await self.web.stop()
             save_json(self.state_path, self.known)
             remove_pid("server")
+
+    def tls_files(self) -> tuple:
+        """(cert, key) for TLS; mode 'auto' creates a self-signed pair once and keeps it."""
+        tls = self.cfg["tls"]
+        if tls["mode"] == "off":
+            return "", ""
+        if tls["mode"] == "files":
+            if certs.usable(tls["cert"], tls["key"]):
+                return tls["cert"], tls["key"]
+            log.error("TLS certificate %s / key %s cannot be loaded - using a self-signed certificate instead",
+                      tls["cert"], tls["key"])
+        cert, key = certs.default_paths()
+        if not certs.usable(cert, key):
+            try:
+                certs.make_self_signed(self.cfg.get("public_address", ""), cert, key)
+                log.info("created a self-signed TLS certificate: %s", cert)
+            except Exception as e:  # noqa: BLE001
+                log.error("cannot create a TLS certificate (%s) - camera connections stay unencrypted", e)
+                return "", ""
+        return cert, key
 
     # -- camera bookkeeping ----------------------------------------------------------------
     def camera_list(self, session: dict) -> list:
@@ -326,11 +363,11 @@ class Server:
         self.agent_throttle.success(ip)
         await sock.send_json({"type": "welcome", "server_name": self.cfg.get("name", ""),
                               "proof": proof(key, "server", nonce, cnonce, agent_id),
-                              "server_version": __version__})
+                              "server_version": __version__, "tls": bool(self.tls_cert)})
         if hello.get("probe"):
             return  # connection test from a camera panel / setup wizard
         name = valid_name(hello.get("agent_name") or agent_id)
-        conn = AgentConn(sock, agent_id, name, username, ip, str(hello.get("version", ""))[:20])
+        conn = AgentConn(sock, agent_id, name, username, ip, str(hello.get("version", ""))[:20], req.secure)
         old = self.agents.get(agent_id)
         if old is not None:
             old.sock.abort()
@@ -339,7 +376,8 @@ class Server:
         info.update({"name": name, "ip": ip, "account": username, "last_seen": int(time.time()),
                      "version": conn.version})
         self._schedule_state_save()
-        log.info("camera system %s (%s) connected from %s as %s", name, agent_id, ip, username)
+        log.info("camera system %s (%s) connected from %s as %s, %s", name, agent_id, ip, username,
+                 "TLS" if req.secure else "unencrypted")
         watchdog = asyncio.ensure_future(self._agent_watchdog(conn))
         try:
             while True:
@@ -496,10 +534,9 @@ class Server:
 
     # -- routes ----------------------------------------------------------------------------
     def connection_info(self) -> dict:
-        tls = self.cfg.get("tls") or {}
         return {"address": self.cfg.get("public_address", ""), "port": self.cfg.get("port"),
-                "tls": bool(tls.get("enabled")),
-                "fingerprint": cert_fingerprint_file(tls.get("cert", "")) if tls.get("enabled") else "",
+                "tls": bool(self.tls_cert), "tls_mode": self.cfg["tls"]["mode"],
+                "fingerprint": certs.fingerprint_file(self.tls_cert) if self.tls_cert else "",
                 "accounts": [a["username"] for a in self.cfg["camera_accounts"]]}
 
     def _routes(self) -> None:
@@ -528,6 +565,8 @@ class Server:
                             "version": info.get("version", ""), "last_seen": info.get("last_seen", 0),
                             "connected_at": int(conn.connected_at) if conn else 0,
                             "bytes_in": conn.bytes_in if conn else 0,
+                            "rate_in": conn.rate_in() if conn else 0,
+                            "secure": conn.secure if conn else False,
                             "cameras": len(info.get("cameras", [])),
                             "streaming": len(conn.subscribed) if conn else 0})
             out.sort(key=lambda a: (not a["online"], a["name"].lower()))
@@ -683,8 +722,7 @@ class Server:
             info = self.connection_info()
             info.update({"name": self.cfg.get("name", ""), "bind": self.cfg.get("bind"),
                          "server_id": self.cfg.get("server_id"), "version": __version__,
-                         "uptime": int(time.time() - self.started),
-                         "tls_cert": (self.cfg.get("tls") or {}).get("cert", "")})
+                         "uptime": int(time.time() - self.started), "tls_cert": self.tls_cert})
             return info
 
         @r("PUT", "/api/settings")

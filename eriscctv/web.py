@@ -8,6 +8,8 @@ import logging
 import mimetypes
 import os
 import re
+import select
+import socket
 import ssl as ssl_mod
 import time
 from email.utils import formatdate
@@ -151,10 +153,15 @@ class HttpServer:
         self.static_dirs.append((prefix.rstrip("/") + "/", os.path.abspath(directory)))
 
     # -- lifecycle -------------------------------------------------------------------
-    async def start(self, host: str, port: int, ssl_ctx=None):
+    async def start(self, host: str, port: int, ssl_ctx=None, also_plain: bool = False):
+        """Listen on host:port. With ssl_ctx and also_plain, TLS and plain HTTP share the one port."""
         self.ssl_ctx = ssl_ctx
-        self.server = await asyncio.start_server(self._handle, host or None, port, ssl=ssl_ctx,
-                                                 limit=65536, reuse_address=True)
+        if ssl_ctx is not None and also_plain:
+            self.server = DualServer(self._handle, host, port, ssl_ctx)
+            self.server.start()
+        else:
+            self.server = await asyncio.start_server(self._handle, host or None, port, ssl=ssl_ctx,
+                                                     limit=65536, reuse_address=True)
         return self.server
 
     async def stop(self):
@@ -175,7 +182,7 @@ class HttpServer:
         self.connections.add(writer)
         peer = writer.get_extra_info("peername")
         remote = peer[0] if peer else "?"
-        secure = self.ssl_ctx is not None
+        secure = writer.get_extra_info("ssl_object") is not None
         try:
             first = True
             while True:
@@ -423,6 +430,98 @@ class HttpServer:
                 left -= len(chunk)
                 await writer.drain()
         return keep
+
+
+class DualServer:
+    """One listening port for TLS and plain HTTP: a connection that starts with 0x16 (TLS handshake)
+    gets TLS, anything else plain HTTP. Browsers keep using http:// while camera systems encrypt."""
+
+    PEEK_TIMEOUT = 20
+
+    def __init__(self, handler, host: str, port: int, ssl_ctx):
+        self.handler = handler
+        self.ssl_ctx = ssl_ctx
+        host = host or "0.0.0.0"
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.sock = socket.create_server((host, port), family=family, backlog=128)
+        self.sock.setblocking(False)
+        self.sockets = [self.sock]
+        self._task = None
+        self._conns = set()
+
+    def start(self) -> None:
+        self._task = asyncio.ensure_future(self._accept())
+
+    async def _accept(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                conn, _ = await loop.sock_accept(self.sock)
+            except asyncio.CancelledError:
+                raise
+            except OSError as e:
+                if self.sock.fileno() == -1:
+                    return
+                log.warning("accept failed: %s", e)
+                await asyncio.sleep(0.5)
+                continue
+            task = asyncio.ensure_future(self._serve(conn))
+            self._conns.add(task)
+            task.add_done_callback(self._conns.discard)
+
+    async def _serve(self, conn: socket.socket) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            first = await asyncio.wait_for(_peek(loop, conn), self.PEEK_TIMEOUT)
+            if not first:
+                conn.close()
+                return
+            reader = asyncio.StreamReader(limit=65536)
+            protocol = asyncio.StreamReaderProtocol(reader)
+            kw = {"ssl": self.ssl_ctx, "ssl_handshake_timeout": 20} if first[0] == 0x16 else {}
+            transport, _ = await loop.connect_accepted_socket(lambda: protocol, conn, **kw)
+        except asyncio.CancelledError:
+            conn.close()
+            raise
+        except Exception:  # noqa: BLE001 - failed handshake, timeout, reset: drop the connection
+            conn.close()
+            return
+        await self.handler(reader, asyncio.StreamWriter(transport, protocol, reader, loop))
+
+    def close(self) -> None:
+        if self._task:
+            self._task.cancel()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    async def wait_closed(self) -> None:
+        if self._task:
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def _peek(loop, conn: socket.socket) -> bytes:
+    """First byte of a new connection, left in the socket for the TLS layer / HTTP parser."""
+    while True:
+        try:
+            ready = loop.create_future()
+            loop.add_reader(conn.fileno(), lambda: ready.done() or ready.set_result(None))
+        except NotImplementedError:  # Windows proactor loop has no add_reader
+            while not select.select([conn], [], [], 0)[0]:
+                await asyncio.sleep(0.05)
+        else:
+            try:
+                await ready
+            finally:
+                loop.remove_reader(conn.fileno())
+        try:
+            return conn.recv(1, socket.MSG_PEEK)
+        except (BlockingIOError, InterruptedError):
+            continue
 
 
 def make_server_ssl(cert: str, key: str):

@@ -117,13 +117,16 @@ App.register("systems", {
         };
         items.appendChild(h("div.item",
           h("div.grow",
-            h("div.title", ag.name, ag.online ? stateBadge("online", "Online") : stateBadge("offline", "Offline")),
+            h("div.title", ag.name, ag.online ? stateBadge("online", "Online") : stateBadge("offline", "Offline"),
+              ag.online ? (ag.secure ? h("span.badge.info.plain", "Encrypted") : h("span.badge.warn.plain", "Not encrypted")) : null),
             h("div.sub", [ag.online ? "Connected " + fmtAgo(ag.connected_at) : "Last seen " + fmtAgo(ag.last_seen),
               "from " + (ag.ip || "?"), "account " + (ag.account || "?"), ag.version ? "v" + ag.version : ""].filter(Boolean).join("  ·  ")),
+            ag.online && !ag.secure ? h("div.err-line", "Unencrypted link. Many networks throttle unencrypted uploads, which leaves the video stuck on \"Starting video\". " +
+              "Update this camera system to Eris CCTV 1.1 or newer - it then encrypts automatically.") : null,
             h("div.chips",
               cams.map((x) => h("span.chip", x.name + (x.online ? "" : " (off)"))),
               ag.online ? h("span.chip", "Received " + fmtBytes(ag.bytes_in)) : null,
-              ag.online && ag.streaming ? h("span.chip", "Streaming " + ag.streaming + " now") : null)),
+              ag.online && ag.streaming ? h("span.chip", "Streaming " + ag.streaming + " now, " + fmtRate(ag.rate_in * 8)) : null)),
           h("div.acts", ag.online ? null : forget)));
       }
       box.appendChild(items);
@@ -153,7 +156,7 @@ App.register("accounts", {
           h("dt", "Server address"), h("dd", copyable(addr), cn.address ? null : h("span.faint.small", "  (set the public address in Settings)")),
           h("dt", "Port"), h("dd", copyable(String(cn.port))),
           h("dt", "Username / password"), h("dd", "one of the camera accounts below"),
-          h("dt", "TLS"), h("dd", cn.tls ? "Yes" : "No"),
+          h("dt", "Encryption"), h("dd", cn.tls ? "Automatic (TLS) - nothing to set on the camera system" : "Off on this server"),
           cn.tls && cn.fingerprint ? [h("dt", "Certificate"), h("dd", h("span.mono.small", cn.fingerprint))] : null)));
       const rows = d.accounts.map((a) => {
         const pw = h("button.btn.sm", "New password");
@@ -303,7 +306,8 @@ App.register("settings", {
           h("dt", "Version"), h("dd", "Eris CCTV " + s.version),
           h("dt", "Port"), h("dd", String(s.port)),
           h("dt", "Listening on"), h("dd", s.bind === "0.0.0.0" ? "all network interfaces" : s.bind),
-          h("dt", "TLS (https)"), h("dd", s.tls ? "On" : "Off"),
+          h("dt", "TLS (https)"), h("dd", s.tls ? (s.tls_mode === "files" ? "On - own certificate" : "On - automatic self-signed certificate") +
+            " (http and https both work on port " + s.port + ")" : "Off"),
           s.tls ? [h("dt", "Certificate"), h("dd.mono.small", s.tls_cert)] : null,
           s.tls && s.fingerprint ? [h("dt", "Fingerprint"), h("dd.mono.small", s.fingerprint)] : null,
           h("dt", "Running for"), h("dd", fmtDuration(s.uptime))),

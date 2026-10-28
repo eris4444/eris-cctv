@@ -12,7 +12,7 @@ import time
 from . import __version__, devices
 from .auth import check_secret, make_secret
 from .camera import CameraWorker, kill_all_orphans
-from .link import ServerLink, test_server
+from .link import TLS_MODES, ServerLink, test_server
 from .panel import PanelAuth, as_float, as_int, need_login
 from .storage import StorageManager, default_folder, list_drives, mount_partition
 from .util import (IS_WINDOWS, config_path, ffmpeg_features, find_ffmpeg, hostname, load_json, local_ips,
@@ -40,6 +40,11 @@ def load_config(path: str = "") -> dict:
         cfg.setdefault(k, v)
     for k, v in base["panel"].items():
         cfg["panel"].setdefault(k, v)
+    for s in cfg["servers"]:
+        if s.get("tls_mode") not in TLS_MODES:
+            # 1.0 had tls: true/false; "false" usually meant "the server had no TLS yet"
+            s["tls_mode"] = "on" if s.get("tls") is True else "auto"
+        s.pop("tls", None)
     return cfg
 
 
@@ -61,11 +66,11 @@ def camera_from_device(cfg: dict, dev: dict, audio, name: str = "", modes=None) 
             "rotate": 0, "mirror": False, "timestamp": True}
 
 
-def new_server_entry(address: str, port: int, username: str, password: str, tls: bool = False,
+def new_server_entry(address: str, port: int, username: str, password: str, tls_mode: str = "auto",
                      verify: str = "pin", cameras="all") -> dict:
     return {"id": "srv" + new_id(3), "address": address.strip(), "port": int(port), "username": username,
-            "password": password, "tls": bool(tls), "tls_verify": verify, "tls_pin": "", "enabled": True,
-            "cameras": cameras}
+            "password": password, "tls_mode": tls_mode if tls_mode in TLS_MODES else "auto",
+            "tls_verify": verify, "tls_pin": "", "enabled": True, "cameras": cameras}
 
 
 class LiveViewer:
@@ -358,9 +363,9 @@ class Agent:
         async def edit_server(req):
             need_login(req)
             entry = self._server_cfg(req.params["sid"])
-            old = (entry["address"], entry["port"], entry["tls"])
+            old = (entry["address"], entry["port"])
             self._apply_server(entry, req.json(), new=False)
-            if (entry["address"], entry["port"], entry["tls"]) != old:
+            if (entry["address"], entry["port"]) != old:
                 entry["tls_pin"] = ""
             self.save()
             link = self.links.pop(entry["id"], None)
@@ -668,8 +673,10 @@ class Agent:
             entry["username"] = str(d["username"]).strip()
         if d.get("password") or new:
             entry["password"] = str(d.get("password", ""))
-        if "tls" in d:
-            entry["tls"] = bool(d["tls"])
+        if d.get("tls_mode") in TLS_MODES:
+            entry["tls_mode"] = d["tls_mode"]
+        elif "tls" in d:
+            entry["tls_mode"] = "on" if d["tls"] else "auto"
         if d.get("tls_verify") in ("pin", "ca", "none"):
             entry["tls_verify"] = d["tls_verify"]
         if "tls_pin" in d:

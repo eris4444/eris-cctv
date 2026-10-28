@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import secrets
+import socket
 import ssl
 import struct
 import time
@@ -19,7 +20,12 @@ log = logging.getLogger("link")
 
 KIND_INIT, KIND_FRAG = 1, 2
 MAX_QUEUE_BYTES = 8 * 1024 * 1024
+MAX_LAG = 3.0            # seconds a video fragment may wait to be sent before it is skipped
 AGENT_PATH = "/agent/ws"
+TLS_MODES = ("auto", "on", "off")
+AUTO_TLS_TIMEOUT = 10    # how long "auto" waits for a TLS handshake before trying plain
+PLAIN_RETRY_TLS = 600    # after a server turned out to have no TLS, try TLS again this much later
+SEND_BUFFER = 128 * 1024  # fixed socket send buffer: OS auto-tuning could hold many seconds of video
 
 
 class AuthError(Exception):
@@ -71,29 +77,72 @@ async def handshake(ws, cfg: dict, agent_id: str, agent_name: str, key_cache: di
     return msg
 
 
-async def open_ws(cfg: dict):
-    tls = bool(cfg.get("tls"))
+def tls_mode(cfg: dict) -> str:
+    mode = cfg.get("tls_mode")
+    if mode in TLS_MODES:
+        return mode
+    return "on" if cfg.get("tls") is True else "auto"
+
+
+async def _open_tls(cfg: dict, timeout: float):
     verify = cfg.get("tls_verify") or "pin"
-    ctx = client_ssl(verify) if tls else None
-    ws = await connect(cfg["address"], int(cfg["port"]), AGENT_PATH, ssl_ctx=ctx)
-    fp = ""
-    if tls:
-        sslobj = ws.writer.get_extra_info("ssl_object")
-        der = sslobj.getpeercert(binary_form=True) if sslobj else b""
-        fp = cert_fingerprint(der or b"")
-        if verify == "pin" and cfg.get("tls_pin") and not same(fp, cfg["tls_pin"]):
-            ws.abort()
-            raise AuthError("TLS certificate changed! Expected %s..., got %s..." % (cfg["tls_pin"][:16], fp[:16]))
+    ws = await connect(cfg["address"], int(cfg["port"]), AGENT_PATH, ssl_ctx=client_ssl(verify), timeout=timeout)
+    sslobj = ws.writer.get_extra_info("ssl_object")
+    der = sslobj.getpeercert(binary_form=True) if sslobj else b""
+    fp = cert_fingerprint(der or b"")
+    if verify == "pin" and cfg.get("tls_pin") and not same(fp, cfg["tls_pin"]):
+        ws.abort()
+        raise AuthError("The server's TLS certificate changed (expected %s..., got %s...). If you reinstalled "
+                        "the server, open this server in the camera panel and choose \"Forget pinned "
+                        "certificate\"." % (cfg["tls_pin"][:16], fp[:16]))
     return ws, fp
+
+
+async def open_ws(cfg: dict, plain_first: bool = False):
+    """Connect to a server. Returns (ws, certificate fingerprint, encrypted?).
+
+    tls_mode "auto" uses TLS whenever the server offers it and falls back to plain only for servers
+    that never had TLS (no pinned certificate yet). Many networks throttle unencrypted uploads, so
+    the camera stream should travel inside TLS.
+    """
+    mode = tls_mode(cfg)
+    if mode == "on" or (mode == "auto" and (cfg.get("tls_pin") or not plain_first)):
+        try:
+            ws, fp = await _open_tls(cfg, 15 if mode == "on" or cfg.get("tls_pin") else AUTO_TLS_TIMEOUT)
+            _limit_send_buffer(ws)
+            return ws, fp, True
+        except ssl.SSLCertVerificationError:
+            raise
+        except (ssl.SSLError, asyncio.TimeoutError, ConnectionError, HandshakeError, OSError) as e:
+            if mode == "on" or cfg.get("tls_pin"):
+                raise
+            log.info("server %s:%s: no TLS (%s) - trying an unencrypted connection", cfg["address"], cfg["port"],
+                     describe_error(e))
+    ws = await connect(cfg["address"], int(cfg["port"]), AGENT_PATH)
+    _limit_send_buffer(ws)
+    return ws, "", False
+
+
+def _limit_send_buffer(ws) -> None:
+    """Keep buffers below the app small so a slow uplink makes the sender wait (and skip stale
+    fragments) instead of hiding seconds of video in the OS / asyncio TLS buffers (512 KiB default)."""
+    sock = ws.writer.get_extra_info("socket")
+    try:
+        if sock is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SEND_BUFFER)
+        ws.writer.transport.set_write_buffer_limits(high=64 * 1024)
+    except (OSError, AttributeError, NotImplementedError):
+        pass
 
 
 async def test_server(cfg: dict, agent_id: str, agent_name: str) -> dict:
     """One-off connection test used by the setup wizard and the panel."""
     ws = None
     try:
-        ws, fp = await open_ws(cfg)
+        ws, fp, secure = await open_ws(cfg)
         welcome = await handshake(ws, cfg, agent_id, agent_name, {}, probe=True)
-        return {"ok": True, "server_name": welcome.get("server_name", ""), "fingerprint": fp}
+        return {"ok": True, "server_name": welcome.get("server_name", ""), "fingerprint": fp, "secure": secure,
+                "server_version": welcome.get("server_version", ""), "server_tls": bool(welcome.get("tls"))}
     except AuthError as e:
         return {"ok": False, "error": str(e)}
     except ssl.SSLCertVerificationError as e:
@@ -134,24 +183,39 @@ class ServerLink:
         self.last_attempt = 0.0
         self.bytes_sent = 0
         self.dropped = 0
+        self.secure = False
+        self.server_tls = False
         self.subscribed = set()
         self.primed = set()
         self.ws = None
         self._task = None
-        self._queue = collections.deque()
+        self._queue = collections.deque()  # (queued at, kind, framed bytes)
         self._queued = 0
         self._wake = asyncio.Event()
         self._key_cache: dict = {}
         self._cams_dirty = asyncio.Event()
+        self._plain_until = 0.0
+        self._rate = (time.monotonic(), 0, 0)
+
+    def rate_out(self) -> int:
+        t0, b0, rate = self._rate
+        now = time.monotonic()
+        if now - t0 >= 1:
+            rate = int((self.bytes_sent - b0) / (now - t0))
+            self._rate = (now, self.bytes_sent, rate)
+        return rate
 
     def public(self) -> dict:
         c = self.cfg
+        connected = self.state == "connected"
         return {"id": self.id, "address": c["address"], "port": c["port"], "username": c["username"],
-                "tls": bool(c.get("tls")), "tls_verify": c.get("tls_verify", "pin"),
+                "tls_mode": tls_mode(c), "tls_verify": c.get("tls_verify", "pin"),
                 "tls_pin": c.get("tls_pin", ""), "enabled": bool(c.get("enabled", True)),
                 "cameras": c.get("cameras", "all"), "state": self.state, "error": self.error,
                 "server_name": self.server_name, "bytes_sent": self.bytes_sent, "dropped": self.dropped,
-                "connected_since": int(self.connected_since) if self.state == "connected" else 0,
+                "rate": self.rate_out() if connected else 0, "secure": connected and self.secure,
+                "server_tls": self.server_tls,
+                "connected_since": int(self.connected_since) if connected else 0,
                 "watching": sorted(self.subscribed)}
 
     def shares(self, cam_id: str) -> bool:
@@ -187,6 +251,7 @@ class ServerLink:
                 return
             self.state = "connecting"
             self.last_attempt = time.time()
+            self.connected_since = 0.0
             try:
                 await self._session()
                 backoff = 3
@@ -204,6 +269,8 @@ class ServerLink:
                 if self.ws:
                     self.ws.abort()
                     self.ws = None
+            if self.connected_since and backoff < 60:
+                backoff = 2  # the link was up: come back quickly, viewers are probably waiting
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -216,16 +283,22 @@ class ServerLink:
         self._queued = 0
 
     async def _session(self) -> None:
-        ws, fp = await open_ws(self.cfg)
-        self.ws = ws
-        if self.cfg.get("tls") and self.cfg.get("tls_verify", "pin") == "pin" and not self.cfg.get("tls_pin"):
-            self.cfg["tls_pin"] = fp
-            self.agent.save()
+        ws, fp, secure = await open_ws(self.cfg, plain_first=time.monotonic() < self._plain_until)
+        self.ws, self.secure = ws, secure
+        if not secure and tls_mode(self.cfg) == "auto":
+            self._plain_until = time.monotonic() + PLAIN_RETRY_TLS
         welcome = await handshake(ws, self.cfg, self.agent.agent_id, self.agent.name, self._key_cache)
+        if secure and self.cfg.get("tls_verify", "pin") == "pin" and not self.cfg.get("tls_pin"):
+            self.cfg["tls_pin"] = fp  # trust on first use, only after the server proved the password
+            self.agent.save()
+        self.server_tls = bool(welcome.get("tls")) or secure
+        if self.server_tls and not secure:
+            self._plain_until = 0.0  # the server offers TLS now: use it from the next connection on
         self.server_name = welcome.get("server_name", "")
         self.state, self.error = "connected", ""
         self.connected_since = time.time()
-        log.info("connected to server %s:%s (%s)", self.cfg["address"], self.cfg["port"], self.server_name)
+        log.info("connected to server %s:%s (%s), %s", self.cfg["address"], self.cfg["port"], self.server_name,
+                 "TLS" if secure else "NOT encrypted")
         for cam in self.agent.cameras.values():
             cam.add(self)
         await self._send_cameras()
@@ -277,22 +350,43 @@ class ServerLink:
         if cam.id in self.primed:
             self._enqueue(KIND_FRAG, cam.slot, data)
 
+    def _prune(self) -> None:
+        """Forget fragments that waited longer than MAX_LAG while the sender was stuck on a slow link."""
+        now = time.monotonic()
+        if not self._queue or now - self._queue[0][0] <= MAX_LAG:
+            return
+        keep = collections.deque()
+        for item in self._queue:
+            if item[1] == KIND_FRAG and now - item[0] > MAX_LAG:
+                self.dropped += 1
+                self._queued -= len(item[2]) - 3
+            else:
+                keep.append(item)
+        self._queue = keep
+
     def _enqueue(self, kind: int, slot: int, data: bytes, force: bool = False) -> None:
+        self._prune()
         if not force and self._queued + len(data) > MAX_QUEUE_BYTES:
             self.dropped += 1
             return
-        self._queue.append(struct.pack(">BH", kind, slot) + data)
+        self._queue.append((time.monotonic(), kind, struct.pack(">BH", kind, slot) + data))
         self._queued += len(data)
         self._wake.set()
 
     async def _sender(self) -> None:
+        """Sends queued media. On a link slower than the camera, fragments that waited longer than
+        MAX_LAG are skipped (each one starts with a keyframe), so viewers stay live instead of falling
+        minutes behind."""
         try:
             while True:
                 await self._wake.wait()
                 self._wake.clear()
                 while self._queue and self.ws:
-                    item = self._queue.popleft()
+                    queued_at, kind, item = self._queue.popleft()
                     self._queued -= len(item) - 3
+                    if kind == KIND_FRAG and time.monotonic() - queued_at > MAX_LAG:
+                        self.dropped += 1
+                        continue
                     await self.ws.send_bytes(item)
                     self.bytes_sent += len(item)
         except WebSocketClosed:

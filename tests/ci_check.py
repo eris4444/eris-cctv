@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--cameras", type=int, default=1)
     ap.add_argument("--audio", action="store_true")
     ap.add_argument("--recordings", action="store_true")
+    ap.add_argument("--secure", action="store_true", help="the camera -> server links must use TLS")
     a = ap.parse_args()
 
     if a.agent:
@@ -100,6 +101,8 @@ def main():
         print("   ", json.dumps([{k: s.get(k) for k in ("address", "state", "error")} for s in body["servers"]]))
         check(sum(1 for c in body["cameras"] if c["online"]) >= a.cameras, "%d camera(s) live on the camera system" % a.cameras)
         check(all(s["state"] == "connected" for s in body["servers"]), "camera system connected to its server(s)")
+        if a.secure:
+            check(all(s["secure"] and s["tls_pin"] for s in body["servers"]), "links encrypted (TLS, certificate pinned)")
         cam = body["cameras"][0]
         init, frags, _ = asyncio.run(watch(a.agent, "/api/live/" + cam["id"], cookie))
         check(init and frags >= 3, "local live view streams (%d fragments)" % frags)
@@ -132,6 +135,9 @@ def main():
             check(init and frags >= 3, "%s streams through the server (%s, %d fragments)" % (c["name"], info["codec"], frags))
             if a.audio:
                 check(info["audio"], "%s has audio" % c["name"])
+        if a.secure:
+            st, ag, _ = call(a.server, "GET", "/api/agents", cookie=cookie)
+            check(all(x["secure"] for x in ag["agents"] if x["online"]), "server sees encrypted camera links")
     print("ALL CHECKS PASSED")
 
 

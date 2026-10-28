@@ -60,11 +60,13 @@ def main():
                 "n",              # different panel login
                 "boss", "bosspass1", "bosspass1",
                 "",               # public address (default 127.0.0.1)
-                "1"])             # no TLS
+                "1"])             # TLS: automatic self-signed certificate
     builtins.input = s
     getpass.getpass = s
     cli.setup_server()
     cfg = load_json(config_path("server"))
+    check(cfg["tls"]["mode"] == "auto", "TLS mode automatic")
+    check(os.path.isfile(os.path.join(HOME, "config", "tls", "cert.pem")), "self-signed certificate created")
     check(cfg["port"] == 18877, "server port saved")
     check(cfg["camera_accounts"][0]["username"] == "camuser", "camera account saved")
     check(cfg["users"][0]["username"] == "boss" and cfg["users"][0]["role"] == "admin", "panel admin saved")
@@ -89,9 +91,9 @@ def main():
                 "n",               # LAN access: no
                 "y",               # add a server now
                 "127.0.0.1:18877",  # address with port
-                "camuser", "wrongpass", "n",   # user, password (wrong), TLS
+                "camuser", "wrongpass",  # user, password (wrong)
                 "1",               # try again
-                "127.0.0.1", "18877", "camuser", "camsecret1", "n",
+                "127.0.0.1", "18877", "camuser", "camsecret1",
                 "n",               # add another server
                 "n"])              # recording off
     builtins.input = s
@@ -105,8 +107,29 @@ def main():
     check(cfg["panel"]["port"] == 18091 and cfg["panel"]["bind"] == "127.0.0.1", "panel port + local-only access")
     check(len(cfg["servers"]) == 1 and cfg["servers"][0]["password"] == "camsecret1",
           "server saved after the retry with the right password")
+    from eriscctv.certs import default_paths, fingerprint_file
+    check(cfg["servers"][0]["tls_mode"] == "auto", "link encryption automatic")
+    check(cfg["servers"][0]["tls_pin"] == fingerprint_file(default_paths()[0]),
+          "the connection test used TLS and pinned the server certificate")
     check(any("Try again" in p or "Choose" in p for p in s.prompts), "wrong password offered a retry")
     check(cfg["storage"]["enabled"] is False, "recording left off")
+
+    print("== 1.0 config migration ==")
+    from eriscctv import agent as agent_mod
+    from eriscctv.util import save_json
+    old_srv = os.path.join(HOME, "old-server.json")
+    save_json(old_srv, {"port": 8800, "tls": {"enabled": False, "cert": "", "key": ""}})
+    check(server_mod.load_config(old_srv)["tls"]["mode"] == "auto", "server without TLS -> automatic TLS")
+    save_json(old_srv, {"port": 8800, "tls": {"enabled": True, "cert": "/x/c.pem", "key": "/x/k.pem"}})
+    check(server_mod.load_config(old_srv)["tls"] == {"mode": "files", "cert": "/x/c.pem", "key": "/x/k.pem"},
+          "server with its own certificate keeps it")
+    old_agent = os.path.join(HOME, "old-agent.json")
+    save_json(old_agent, {"agent_id": "abcd1234", "servers": [
+        {"id": "s1", "address": "a", "port": 1, "username": "u", "password": "p", "tls": False},
+        {"id": "s2", "address": "b", "port": 2, "username": "u", "password": "p", "tls": True, "tls_pin": "ff"}]})
+    servers = agent_mod.load_config(old_agent)["servers"]
+    check([s["tls_mode"] for s in servers] == ["auto", "on"] and "tls" not in servers[0],
+          "camera links: tls false -> automatic, tls true -> always")
 
     print("== number parsing ==")
     check(cli.parse_numbers("1,3", 3) == [1, 3], "1,3")

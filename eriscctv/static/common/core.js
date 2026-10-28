@@ -401,13 +401,22 @@ function cameraTile(opts) {
     ovText.textContent = text || "";
     ovSpin.classList.toggle("hidden", !spin);
   };
-  video.addEventListener("playing", () => overlay.classList.add("hidden"));
+  let slowTimer = null;
+  video.addEventListener("playing", () => { clearTimeout(slowTimer); overlay.classList.add("hidden"); });
   const player = new LivePlayer(video, opts.url, (m) => {
     if (m.name) tile.querySelector(".label b").textContent = m.name;
     soundBtn.classList.toggle("hidden", !m.audio);
+    clearTimeout(slowTimer);
     if (m.online) {
       liveBadge.className = "badge ok"; liveBadge.textContent = "Live";
-      if (video.paused || video.readyState < 2) show("Starting video...", "", true);
+      if (video.paused || video.readyState < 2) {
+        show("Starting video...", "", true);
+        slowTimer = setTimeout(() => {
+          if (video.paused || video.readyState < 2) {
+            ovText.textContent = "No picture yet. The camera system's upload may be very slow or throttled (an unencrypted link is a common cause).";
+          }
+        }, 15000);
+      }
     } else {
       liveBadge.className = "badge plain"; liveBadge.textContent = m.reconnecting ? "Reconnecting" : "Offline";
       const state = m.state === "starting" ? "Camera is starting..." : (m.reconnecting ? "Reconnecting..." : "Camera offline");
@@ -418,7 +427,7 @@ function cameraTile(opts) {
   return {
     el: tile,
     start: () => player.start(),
-    stop: () => player.stop(),
+    stop: () => { clearTimeout(slowTimer); player.stop(); },
     setRecording: (on) => recBadge.classList.toggle("hidden", !on),
     setSubtitle: (t) => { sub.textContent = t; },
   };

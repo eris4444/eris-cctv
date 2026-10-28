@@ -38,13 +38,16 @@ no VPN.
   filter by camera system, audio on/off, snapshot, full screen.
 - Camera accounts (the username/password camera systems log in with), panel users (administrator or
   viewer), and per-user camera permissions.
-- Optional HTTPS: self-signed certificate (created for you) or your own certificate files.
+- TLS and plain HTTP on the **same port**: camera systems encrypt automatically, browsers can keep
+  using `http://` (or `https://`). The certificate is self-signed and created for you (no openssl
+  needed), or use your own certificate files.
 
 **Security**
 - Passwords are stored only as PBKDF2 hashes.
-- Camera systems log in with a challenge/response (HMAC) - the password never crosses the network,
-  even without TLS - and the server has to prove it knows the password too.
-- With TLS the camera system pins the server certificate on first contact (trust on first use).
+- Camera systems log in with a challenge/response (HMAC) - the password never crosses the network -
+  and the server has to prove it knows the password too.
+- The camera -> server link uses TLS automatically and pins the server certificate on first contact
+  (trust on first use). Many networks throttle unencrypted uploads, so this also keeps video moving.
 - Login throttling, HttpOnly + SameSite cookies, CSRF header check, strict Content-Security-Policy.
 
 ## Install
@@ -92,7 +95,7 @@ On the server (for example a VPS) choose **2) This system is a SERVER**. You are
 | Camera account username / password | `camera` / `********` |
 | Use the same login for the web panel? | yes, or a separate admin user |
 | Public address (IP or domain) | detected automatically |
-| TLS | off / self-signed / own certificate |
+| Encryption (TLS) | automatic self-signed certificate (recommended) / own certificate / off |
 
 At the end it prints the panel address and the details to enter on the camera systems. On Linux the
 port is opened in `ufw`/`firewalld` automatically; open it in your VPS provider's firewall too.
@@ -111,8 +114,8 @@ On every computer with webcams choose **1) This system is a CAMERA**:
 ```
 
 Then set the local panel password, add the server (address, port, username, password - the
-connection is tested immediately) and optionally pick a drive for recordings. The agent starts in the
-background and starts again after a reboot.
+connection is tested immediately and encrypted automatically) and optionally pick a drive for
+recordings. The agent starts in the background and starts again after a reboot.
 
 ### 3. Watch
 
@@ -135,12 +138,15 @@ Non-interactive setup (for scripts):
 
 ```bash
 sudo eris-cctv setup-server --port 8800 --camera-user camera --camera-password 'S3cret!' \
-     --admin-user admin --admin-password 'AdminPass' --address 203.0.113.10 --tls self-signed
+     --admin-user admin --admin-password 'AdminPass' --address 203.0.113.10 [--tls auto|files|off]
 
 sudo eris-cctv setup-camera --cameras 1,2 --audio yes --panel-password 'PanelPass' \
-     --server 203.0.113.10:8800 --server-user camera --server-password 'S3cret!' [--server-tls] \
-     [--record-path /mnt/disk/ErisCCTV]
+     --server 203.0.113.10:8800 --server-user camera --server-password 'S3cret!' \
+     [--server-tls auto|on|off] [--record-path /mnt/disk/ErisCCTV]
 ```
+
+`--server-tls auto` (the default) encrypts whenever the server offers TLS and falls back to an
+unencrypted link only for servers that never had TLS; `--server-tls` alone means `on` (TLS required).
 
 ## Requirements
 
@@ -171,6 +177,16 @@ sudo eris-cctv setup-camera --cameras 1,2 --audio yes --panel-password 'PanelPas
 - **Camera system cannot reach the server:** the camera panel's *Servers* page shows the exact
   reason (wrong password, connection refused, timeout, TLS problem). Make sure the server port is
   open in every firewall on the way.
+- **Server panel stays on "Starting video..." and the link reconnects every 20-50 s:** the network
+  throttles unencrypted uploads (seen on Iranian lines: plain uploads abroad crawl at ~5 KB/s and are
+  reset after ~20 s, while TLS runs at full speed). Update **both** the server and the camera system
+  to 1.1 or newer - the link then uses TLS automatically. The *Servers* page of the camera panel and
+  the *Camera systems* page of the server show "Encrypted" for every link.
+- **"The server's TLS certificate changed":** the server was reinstalled or got a new certificate.
+  In the camera panel open *Servers -> Edit* and click *Forget pinned certificate*.
+- **Slow upload:** when the uplink is slower than the camera, the agent skips stale fragments so the
+  picture stays live (a few seconds behind at most). Lower the camera's quality or resolution in
+  *Cameras -> Edit* for a smooth picture.
 - **Windows firewall prompt:** allow Python on private networks if other devices should open the
   camera panel.
 - **Server behind Cloudflare / a reverse proxy:** proxy both `/` and the WebSocket paths
@@ -179,13 +195,24 @@ sudo eris-cctv setup-camera --cameras 1,2 --audio yes --panel-password 'PanelPas
 ## Development
 
 ```bash
-python tests/e2e_test.py      # server + camera (test pattern) + viewers + recording, one process
-python tests/wizard_test.py   # drives the setup menus with scripted answers
-python tests/dev_run.py       # dev server on :18800 (admin/adminpass) and camera panel on :18090
+python tests/e2e_test.py       # server + camera (test pattern) + viewers + recording, one process
+python tests/wizard_test.py    # drives the setup menus with scripted answers
+python tests/throttle_test.py  # camera link through a network that throttles unencrypted uploads
+python tests/certs_test.py     # self-signed certificate generator + TLS handshake
+python tests/dev_run.py        # dev server on :18800 (admin/adminpass) and camera panel on :18090
 ```
 
-CI runs the tests on Python 3.8 and 3.12, a full `install.sh` install with systemd and TLS, and a
-simulated USB webcam (v4l2loopback) with an ALSA microphone.
+CI runs the tests on Python 3.8 and 3.12, a full `install.sh` install with systemd and TLS, an
+upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webcam (v4l2loopback).
+
+## Changes
+
+- **1.1.0** - The camera -> server link is encrypted automatically: the server serves TLS and plain
+  HTTP on the same port with a self-signed certificate it creates itself, camera systems use TLS
+  whenever it is offered (fixes "Starting video..." on networks that throttle unencrypted uploads).
+  Quick reconnects, stale video skipped on slow uplinks, link encryption and speed shown in both
+  panels.
+- **1.0.0** - First release.
 
 ## License
 

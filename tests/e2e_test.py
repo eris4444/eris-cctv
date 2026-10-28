@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -57,8 +58,24 @@ async def ahttp(*a, **kw):
     return await asyncio.get_running_loop().run_in_executor(None, lambda: api(*a, **kw))
 
 
-async def watch(port, path, cookie, want_frags=3, timeout=40):
-    ws = await connect("127.0.0.1", port, path, headers={"Cookie": cookie})
+def insecure_ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def https_get(port, path, cookie=""):
+    c = http.client.HTTPSConnection("127.0.0.1", port, timeout=20, context=insecure_ctx())
+    c.request("GET", path, headers={"Cookie": cookie} if cookie else {})
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    return r.status, json.loads(data)
+
+
+async def watch(port, path, cookie, want_frags=3, timeout=40, tls=False):
+    ws = await connect("127.0.0.1", port, path, headers={"Cookie": cookie}, ssl_ctx=insecure_ctx() if tls else None)
     metas, init, frags = [], None, 0
     deadline = time.time() + timeout
     try:
@@ -138,6 +155,14 @@ async def main():
     check(frags >= 3, "%d media fragments received" % frags)
     check(any(m.get("online") for m in metas), "meta says online")
 
+    print("TLS and plain HTTP on the same port")
+    status, body = await asyncio.get_running_loop().run_in_executor(None, https_get, SERVER_PORT, "/api/session")
+    check(status == 200 and body["app"] == "server", "https:// on the server port answers")
+    metas, init, frags = await watch(SERVER_PORT, "/api/view/%s/%s" % (agent_id, cam_id), cookie, tls=True)
+    check(init is not None and frags >= 3, "live view over wss:// (%d fragments)" % frags)
+    status, body, _ = await ahttp(SERVER_PORT, "GET", "/api/agents", cookie=cookie)
+    check(body["agents"][0]["secure"] is True, "the camera system's link is encrypted (TLS)")
+
     print("permissions")
     status, body, gcookie = await ahttp(SERVER_PORT, "POST", "/api/login",
                                         {"username": "guest", "password": "guestpass"})
@@ -164,6 +189,7 @@ async def main():
     status, body, _ = await ahttp(AGENT_PORT, "GET", "/api/status", cookie=acookie)
     srv = {s["port"]: s for s in body["servers"]}
     check(srv[SERVER_PORT]["state"] == "connected", "agent shows server connected")
+    check(srv[SERVER_PORT]["secure"] and srv[SERVER_PORT]["tls_pin"], "agent link uses TLS and pinned the certificate")
     check(srv[SERVER_PORT + 1]["state"] in ("error", "connecting"), "unreachable server reported: %s"
           % srv[SERVER_PORT + 1]["error"])
     check(body["storage"]["state"] == "ok", "storage ok: %s" % body["storage"]["message"])
@@ -177,7 +203,12 @@ async def main():
     status, body, _ = await ahttp(AGENT_PORT, "POST", "/api/servers/test",
                                   {"address": "127.0.0.1", "port": SERVER_PORT, "username": "cam",
                                    "password": "campass1"}, cookie=acookie)
-    check(body.get("ok") is True, "server test with right password: %s" % body)
+    check(body.get("ok") is True and body.get("secure") is True, "server test with right password: %s" % body)
+    status, body, _ = await ahttp(AGENT_PORT, "POST", "/api/servers/test",
+                                  {"address": "127.0.0.1", "port": SERVER_PORT, "username": "cam",
+                                   "password": "campass1", "tls_mode": "off"}, cookie=acookie)
+    check(body.get("ok") is True and body.get("secure") is False and body.get("server_tls") is True,
+          "an unencrypted camera login still works on the same port: %s" % body)
     status, body, _ = await ahttp(AGENT_PORT, "GET", "/api/storage/drives", cookie=acookie)
     check(status == 200 and body["drives"], "%d drive(s) listed" % len(body["drives"]))
 

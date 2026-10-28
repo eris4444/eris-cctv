@@ -30,10 +30,14 @@ jobs:
         run: for f in eriscctv/static/*/*.js; do node --check "$f"; done
       - name: Check install.sh
         run: bash -n install.sh
+      - name: Certificate generator test
+        run: python tests/certs_test.py
       - name: End-to-end test (server + camera + viewers + recording)
         run: python tests/e2e_test.py
       - name: Setup wizard test
         run: python tests/wizard_test.py
+      - name: Network that throttles unencrypted uploads
+        run: python tests/throttle_test.py
 
   install:
     name: Real install (systemd, TLS, update, uninstall)
@@ -53,7 +57,8 @@ jobs:
       - name: Check through the panels
         run: |
           python3 tests/ci_check.py --server https://127.0.0.1:8800 --password adminpass1 \
-            --agent http://127.0.0.1:8090 --agent-password panelpass --audio --recordings
+            --agent http://127.0.0.1:8090 --agent-password panelpass --audio --recordings --secure
+          python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1
       - name: Status
         run: |
           sudo eris-cctv status
@@ -76,8 +81,40 @@ jobs:
           sudo journalctl -u eris-cctv-agent -u eris-cctv-server --no-pager | tail -n 150 || true
           sudo tail -n 150 /var/log/eris-cctv/*.log || true
 
+  upgrade:
+    name: Upgrade from 1.0 (unencrypted link) to this version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install 1.0.0 as server + camera without TLS
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          mkdir /tmp/old
+          curl -fsSL https://codeload.github.com/eris4444/eris-cctv/tar.gz/refs/tags/v1.0.0 | tar -xz -C /tmp/old
+          OLD=$(ls -d /tmp/old/*/)
+          sudo ERIS_CCTV_SRC="$OLD" bash "$OLD/install.sh" setup-server --port 8800 \
+            --camera-user cam --camera-password campass1 --admin-user admin --admin-password adminpass1 \
+            --address 127.0.0.1 --tls none
+          sudo eris-cctv setup-camera --cameras test --audio no --panel-password panelpass \
+            --server 127.0.0.1:8800 --server-user cam --server-password campass1
+          sudo eris-cctv version
+          python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1 \
+            --agent http://127.0.0.1:8090 --agent-password panelpass
+      - name: Upgrade to this commit (settings are kept)
+        run: |
+          sudo ERIS_CCTV_SRC="$GITHUB_WORKSPACE" bash install.sh status
+          sudo eris-cctv version
+      - name: The same setup is encrypted now
+        run: |
+          python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1 \
+            --agent http://127.0.0.1:8090 --agent-password panelpass --secure
+          python3 tests/ci_check.py --server https://127.0.0.1:8800 --password adminpass1
+      - name: Logs
+        if: always()
+        run: sudo tail -n 80 /var/log/eris-cctv/*.log || true
+
   webcam:
-    name: Simulated USB webcam (v4l2loopback) + ALSA microphone
+    name: Simulated USB webcam (v4l2loopback), ALSA microphone if the kernel has snd-aloop
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -136,7 +173,7 @@ jobs:
       - name: Check
         run: |
           python3 tests/ci_check.py --server http://127.0.0.1:8800 --password adminpass1 \
-            --agent http://127.0.0.1:8090 --agent-password panelpass ${AUDIO:+--audio}
+            --agent http://127.0.0.1:8090 --agent-password panelpass --secure ${AUDIO:+--audio}
       - name: Logs
         if: always()
         run: |

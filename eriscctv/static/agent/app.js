@@ -276,17 +276,26 @@ function serverItem(s, cams, redraw) {
     if (!await confirmBox("Remove server", "Stop sending video to " + s.address + ":" + s.port + "?", "Remove", true)) return;
     await busy(del, async () => { await api("DELETE", "/api/servers/" + s.id); redraw(); });
   };
+  const connected = s.state === "connected";
+  let plainNote = null;
+  if (connected && !s.secure) {
+    plainNote = s.tls_mode === "off" ? "Encryption is off for this server. Many networks throttle unencrypted uploads."
+      : s.server_tls ? "Connected without TLS this time - the next connection uses TLS."
+        : "The server offers no TLS (Eris CCTV older than 1.1). Many networks throttle unencrypted uploads, so the video may never start there - update the server.";
+  }
   return h("div.item",
     h("div.grow",
-      h("div.title", s.address + ":" + s.port, serverState(s), s.tls ? h("span.badge.info.plain", "TLS") : null),
+      h("div.title", s.address + ":" + s.port, serverState(s),
+        connected ? (s.secure ? h("span.badge.info.plain", "Encrypted") : h("span.badge.warn.plain", "Not encrypted")) : null),
       h("div.sub", "User " + s.username + (s.server_name ? "  ·  " + s.server_name : "") +
-        (s.state === "connected" ? "  ·  connected " + fmtAgo(s.connected_since) : "")),
-      s.state !== "connected" && s.error && s.enabled ? h("div.err-line", s.error) : null,
+        (connected ? "  ·  connected " + fmtAgo(s.connected_since) : "")),
+      !connected && s.error && s.enabled ? h("div.err-line", s.error) : null,
+      plainNote ? h("div.err-line", plainNote) : null,
       h("div.chips",
         h("span.chip", "Shares: " + sharing),
         h("span.chip", "Sent " + fmtBytes(s.bytes_sent)),
-        watching.length ? h("span.chip", "Being watched: " + watching.join(", ")) : null,
-        s.dropped ? h("span.chip", s.dropped + " fragments dropped (slow link)") : null)),
+        watching.length ? h("span.chip", "Being watched: " + watching.join(", ") + " (" + fmtRate(s.rate * 8) + ")") : null,
+        s.dropped ? h("span.chip", s.dropped + " fragments skipped (slow link)") : null)),
     h("div.acts", tgl.el,
       h("button.btn.sm", { on: { click: () => serverDialog(s, cams, redraw) } }, "Edit"), del));
 }
@@ -297,14 +306,23 @@ function serverDialog(s, cams, redraw) {
   const port = input("number", s ? s.port : 8800, { min: "1", max: "65535" });
   const user = input("text", s ? s.username : "", { autocomplete: "off" });
   const pass = input("password", "", { autocomplete: "new-password", placeholder: isNew ? "" : "(unchanged)" });
-  const tls = checkbox("Use TLS (https) - only if TLS was enabled on the server", s && s.tls);
+  const mode = select([["auto", "Automatic - TLS whenever the server offers it (recommended)"],
+    ["on", "Always TLS - refuse unencrypted connections"], ["off", "Off - never encrypt"]], s ? s.tls_mode : "auto");
   const verify = select([["pin", "Trust this server's certificate on first connect (pin)"],
     ["ca", "Require a certificate signed by a public CA"], ["none", "Do not check the certificate (not safe)"]],
   s ? s.tls_verify : "pin");
-  const pinInfo = h("div.hint", s && s.tls_pin ? "Pinned fingerprint: " + s.tls_pin.slice(0, 32) + "..." : "");
-  const verifyBox = h("div", field("Certificate check", verify), pinInfo);
-  const syncTls = () => verifyBox.classList.toggle("hidden", !tls.input.checked);
-  tls.input.addEventListener("change", syncTls);
+  const pinInfo = h("div.hint", s && s.tls_pin ? "Pinned fingerprint: " + s.tls_pin.slice(0, 32) + "..." : "No certificate pinned yet.");
+  const forget = h("button.btn.sm" + (s && s.tls_pin ? "" : ".hidden"), { type: "button" }, "Forget pinned certificate");
+  forget.onclick = () => busy(forget, async () => {
+    await api("PUT", "/api/servers/" + s.id, { tls_pin: "" });
+    s.tls_pin = "";
+    pinInfo.textContent = "Forgotten - the next connection pins the server's current certificate.";
+    forget.classList.add("hidden");
+    redraw();
+  });
+  const verifyBox = h("div", field("Certificate check", verify), h("div.row", pinInfo, forget));
+  const syncTls = () => verifyBox.classList.toggle("hidden", mode.value === "off");
+  mode.addEventListener("change", syncTls);
   const all = checkbox("Share all cameras (including ones added later)", !s || s.cameras === "all");
   const camChecks = cams.map((c) => {
     const cb = checkbox(c.name, s && s.cameras !== "all" && s.cameras.includes(c.id));
@@ -321,14 +339,14 @@ function serverDialog(s, cams, redraw) {
   const body = h("div.stack",
     h("div.grid-2", field("Server address (IP or domain)", address), field("Port", port)),
     h("div.grid-2", field("Username", user), field("Password", pass)),
-    tls.el, verifyBox,
+    field("Encryption (TLS)", mode), verifyBox,
     h("div", h("div.small.muted", { style: { marginBottom: "8px" } }, "Cameras sent to this server"), all.el, camBox),
     result);
   const m = modal({ title: isNew ? "Add server" : "Edit server", body, actions: [test, cancel, save] });
   syncTls(); syncCams();
   cancel.onclick = m.close;
   const payload = () => {
-    const b = { address: address.value.trim(), port: Number(port.value), username: user.value.trim(), tls: tls.input.checked,
+    const b = { address: address.value.trim(), port: Number(port.value), username: user.value.trim(), tls_mode: mode.value,
       tls_verify: verify.value, cameras: all.input.checked ? "all" : camChecks.filter((c) => c.input.checked).map((c) => c.input.value) };
     if (pass.value) b.password = pass.value;
     return b;
@@ -341,7 +359,10 @@ function serverDialog(s, cams, redraw) {
     const r = await api("POST", "/api/servers/test", b);
     if (r.ok) {
       result.className = "alert info";
-      result.textContent = "Success - logged in to \"" + (r.server_name || "server") + "\"" + (r.fingerprint ? ". Certificate fingerprint: " + r.fingerprint.slice(0, 32) + "..." : "");
+      result.textContent = "Success - logged in to \"" + (r.server_name || "server") + "\", " +
+        (r.secure ? "encrypted (TLS). Certificate fingerprint: " + r.fingerprint.slice(0, 32) + "..."
+          : "NOT encrypted" + (r.server_tls ? "." : " - the server offers no TLS (older than 1.1); update it, many networks throttle unencrypted uploads."));
+      if (!r.secure) result.className = "alert warn";
     } else {
       result.className = "alert err";
       result.textContent = r.error + (r.tls_untrusted ? " - choose \"Trust on first connect (pin)\"." : "");
@@ -563,7 +584,7 @@ App.register("network", {
         n.servers.length ? h("div.table-wrap", h("table.tbl",
           h("thead", h("tr", h("th", "Server"), h("th", "Status"), h("th", "Connected"), h("th", "Sent"), h("th", "Watching"))),
           h("tbody", n.servers.map((s) => h("tr",
-            h("td.mono", s.address + ":" + s.port + (s.tls ? " (TLS)" : "")),
+            h("td.mono", s.address + ":" + s.port + (s.secure ? " (TLS)" : "")),
             h("td", serverState(s), s.state !== "connected" && s.error ? h("div.small", { style: { color: "#ffb4b0" } }, s.error) : null),
             h("td", s.connected_since ? fmtAgo(s.connected_since).replace(" ago", "") : "-"),
             h("td", fmtBytes(s.bytes_sent)),

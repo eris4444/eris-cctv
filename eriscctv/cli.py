@@ -18,7 +18,7 @@ import time
 import urllib.request
 import zipfile
 
-from . import APP_NAME, REPO, __version__, devices, service
+from . import APP_NAME, REPO, __version__, certs, devices, service
 from .auth import make_secret
 from .util import (IS_LINUX, IS_WINDOWS, app_root, config_path, dirs, ffmpeg_features, find_ffmpeg, h264_encoder,
                    human_bytes, is_root, load_json, local_ips, log_tail, save_json, setup_logging)
@@ -303,6 +303,24 @@ def pkg_install(pm, packages) -> bool:
 
 
 # ------------------------------------------------------------------------------ status
+SERVER_TLS_LABELS = {"auto": "on (automatic self-signed certificate)", "files": "on (own certificate)",
+                     "off": "off"}
+
+
+def server_tls_mode(cfg: dict) -> str:
+    """TLS mode of a server config, also for configs written by 1.0 ({"enabled": bool})."""
+    tls = cfg.get("tls") or {}
+    if tls.get("mode") in SERVER_TLS_LABELS:
+        return tls["mode"]
+    return "files" if tls.get("enabled") and tls.get("cert") else "auto"
+
+
+def tls_label(srv: dict) -> str:
+    from .link import tls_mode
+    return {"auto": "encryption: automatic", "on": "encryption: TLS required",
+            "off": "encryption: off"}[tls_mode(srv)]
+
+
 def roles_state() -> dict:
     out = {}
     for role in ("agent", "server"):
@@ -319,7 +337,8 @@ def panel_urls(role, cfg) -> list:
         if bind == "127.0.0.1":
             return ["http://127.0.0.1:%s" % port]
     else:
-        port, scheme = cfg.get("port", 8800), "https" if (cfg.get("tls") or {}).get("enabled") else "http"
+        # http and https share the port; https only looks clean in the browser with a real certificate
+        port, scheme = cfg.get("port", 8800), "https" if server_tls_mode(cfg) == "files" else "http"
         if cfg.get("public_address"):
             return ["%s://%s:%s" % (scheme, cfg["public_address"], port)]
     ips = local_ips() or ["127.0.0.1"]
@@ -357,7 +376,7 @@ def status_details():
                                                          "" if cam.get("enabled", True) else dim("  disabled")))
         print(bold("  Servers"))
         for srv in a.get("servers", []):
-            print("   - %s:%s  user %s%s" % (srv["address"], srv["port"], srv["username"], "  TLS" if srv.get("tls") else ""))
+            print("   - %s:%s  user %s  %s" % (srv["address"], srv["port"], srv["username"], tls_label(srv)))
         if not a.get("servers"):
             print(dim("   (none)"))
         st_cfg = a.get("storage") or {}
@@ -368,7 +387,7 @@ def status_details():
         print()
         print(bold("  Server"))
         print("   port %s, TLS %s, camera accounts: %s, panel users: %s" % (
-            s.get("port"), "on" if (s.get("tls") or {}).get("enabled") else "off",
+            s.get("port"), SERVER_TLS_LABELS[server_tls_mode(s)],
             ", ".join(x["username"] for x in s.get("camera_accounts", [])) or "-",
             ", ".join(x["username"] for x in s.get("users", [])) or "-"))
         known = load_json(os.path.join(dirs()["data"], "server-agents.json"), {}) or {}
@@ -471,15 +490,18 @@ def server_entry_wizard(agent_cfg, prefill=None) -> dict:
             port = int(ask("Server port", p.get("port", 8800), valid_port))
         user = ask("Username", p.get("username"))
         pw = getpass.getpass("  Password: ")
-        tls = ask_yes("Does the server use TLS (https)?", bool(p.get("tls")))
-        entry = new_server_entry(addr, port, user, pw, tls)
+        entry = new_server_entry(addr, port, user, pw, p.get("tls_mode", "auto"))
         print("  Testing the connection...")
         r = asyncio.run(test_server(entry, agent_cfg["agent_id"], agent_cfg.get("name", "")))
         if r.get("ok"):
-            ok('Connected to "%s"' % (r.get("server_name") or "server"))
-            if tls and r.get("fingerprint"):
+            ok('Connected to "%s" - %s' % (r.get("server_name") or "server",
+                                           "encrypted (TLS)" if r.get("secure") else "NOT encrypted"))
+            if r.get("secure") and r.get("fingerprint"):
                 entry["tls_pin"] = r["fingerprint"]
                 print(dim("    Certificate fingerprint pinned: %s" % r["fingerprint"]))
+            elif not r.get("server_tls"):
+                warn("The server has no TLS (older than 1.1?). Many networks throttle unencrypted uploads - "
+                     "update the server: run eris-cctv on it and choose Update.")
             return entry
         fail(r.get("error", "connection failed"))
         print("    1) Try again   2) Save anyway (it keeps retrying)   3) Skip this server")
@@ -488,7 +510,7 @@ def server_entry_wizard(agent_cfg, prefill=None) -> dict:
             return entry
         if choice == "3":
             return {}
-        p = {"address": addr, "port": port, "username": user, "tls": tls}
+        p = {"address": addr, "port": port, "username": user, "tls_mode": entry["tls_mode"]}
 
 
 def choose_drive() -> dict:
@@ -568,11 +590,12 @@ def setup_camera(args=None):
             if not host:
                 host, port = args.server, "8800"
             entry = new_server_entry(host, int(port), args.server_user or "", args.server_password or "",
-                                     bool(args.server_tls), "pin")
+                                     args.server_tls, "pin")
             cfg["servers"] = [s for s in cfg["servers"] if (s["address"], s["port"]) != (entry["address"], entry["port"])]
             cfg["servers"].append(entry)
     else:
         print(dim("  This system connects OUT to the server - no public IP or port forwarding is needed here."))
+        print(dim("  The link is encrypted automatically when the server offers TLS (Eris CCTV 1.1+)."))
         for s in cfg["servers"]:
             print("   - %s:%s (user %s)" % (s["address"], s["port"], s["username"]))
         more = ask_yes("Add a server now?" if not cfg["servers"] else "Add another server?", not cfg["servers"])
@@ -614,27 +637,36 @@ def setup_camera(args=None):
 
 
 # ------------------------------------------------------------------------------ server setup
-def make_self_signed(address: str) -> tuple:
-    if not shutil.which("openssl"):
-        raise RuntimeError("openssl is not installed")
-    folder = os.path.join(dirs()["config"], "tls")
-    os.makedirs(folder, exist_ok=True)
-    cert, key = os.path.join(folder, "cert.pem"), os.path.join(folder, "key.pem")
-    san = ("IP:" if re.match(r"^[\d.]+$|:", address) else "DNS:") + address
-    base = ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
-            "-days", "3650", "-subj", "/CN=" + (address or "eris-cctv")]
-    r = subprocess.run(base + ["-addext", "subjectAltName=" + san], capture_output=True, text=True)
-    if r.returncode != 0:
-        r = subprocess.run(base, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip()[:300])
-    if not IS_WINDOWS:
-        os.chmod(key, 0o600)
-    return cert, key
+TLS_ARG = {"auto": "auto", "self-signed": "auto", "files": "files", "off": "off", "none": "off"}
+
+
+def apply_server_tls(cfg: dict, mode: str, address: str, cert: str = "", key: str = "") -> str:
+    """Sets the server TLS mode; returns the certificate file in use ("" when there is none)."""
+    tls = cfg["tls"]
+    if mode == "files":
+        if certs.usable(cert, key):
+            tls.update({"mode": "files", "cert": os.path.abspath(cert), "key": os.path.abspath(key)})
+            return tls["cert"]
+        fail("Certificate or key file missing or not usable - using an automatic self-signed certificate.")
+        mode = "auto"
+    tls["mode"] = mode
+    if mode == "off":
+        return ""
+    cert, key = certs.default_paths()
+    if certs.usable(cert, key):
+        return cert  # keep it: camera systems have pinned this certificate
+    print("  Creating a self-signed TLS certificate...")
+    try:
+        certs.make_self_signed(address, cert, key)
+        ok("Self-signed certificate created")
+        return cert
+    except Exception as e:  # noqa: BLE001
+        fail("Could not create a certificate (%s) - camera connections stay unencrypted." % e)
+        return ""
 
 
 def setup_server(args=None):
-    from .server import DEFAULT_PORT, cert_fingerprint_file, default_config, load_config
+    from .server import DEFAULT_PORT, default_config, load_config
     title("Server setup")
     existing = load_json(config_path("server"))
     cfg = load_config() if existing else default_config()
@@ -644,7 +676,7 @@ def setup_server(args=None):
         admin_user = args.admin_user or cam_user
         admin_pw = args.admin_password or cam_pw
         address = args.address or ""
-        tls_mode = args.tls or "none"
+        tls_mode = TLS_ARG[args.tls or "auto"]
         if not cam_pw:
             fail("--camera-password is required")
             raise Abort()
@@ -670,14 +702,13 @@ def setup_server(args=None):
         detected = cfg.get("public_address") or public_ip()
         address = ask("Public address of this server (IP or domain)", detected)
         print()
-        print("  Encryption (TLS / https):")
-        print("    1) Off - plain http (simplest)")
-        print("    2) On  - self-signed certificate (created now)")
-        print("    3) On  - my own certificate files (e.g. Let's Encrypt)")
-        current = "1"
-        if (cfg.get("tls") or {}).get("enabled"):
-            current = "3"
-        tls_mode = {"1": "none", "2": "self-signed", "3": "files"}.get(ask("Choose", current), "none")
+        print("  Encryption (TLS). Camera systems use it automatically; the web panel keeps working with")
+        print("  http:// and https:// on the same port.")
+        print("    1) Automatic - self-signed certificate (recommended)")
+        print("    2) My own certificate files (e.g. Let's Encrypt for a domain)")
+        print("    3) Off - not recommended: many networks throttle unencrypted uploads")
+        current = {"auto": "1", "files": "2", "off": "3"}[cfg["tls"]["mode"]]
+        tls_mode = {"1": "auto", "2": "files", "3": "off"}.get(ask("Choose", current), "auto")
     # accounts
     if cam_pw:
         cfg["camera_accounts"] = [a for a in cfg["camera_accounts"] if a["username"] != cam_user]
@@ -691,25 +722,12 @@ def setup_server(args=None):
         fail("Both a camera account and a panel user are needed.")
         raise Abort()
     cfg["public_address"] = address
-    tls = cfg.setdefault("tls", {"enabled": False, "cert": "", "key": ""})
-    if tls_mode == "none":
-        tls["enabled"] = False
-    elif tls_mode == "self-signed":
-        try:
-            tls["cert"], tls["key"] = make_self_signed(address)
-            tls["enabled"] = True
-            ok("Self-signed certificate created")
-        except Exception as e:  # noqa: BLE001
-            fail("Could not create a certificate (%s) - TLS stays off." % e)
-            tls["enabled"] = False
-    elif tls_mode == "files":
+    cert = key = ""
+    if tls_mode == "files":
+        tls = cfg["tls"]
         cert = (args.cert if args is not None else ask("Certificate file (fullchain.pem)", tls.get("cert")))
         key = (args.key if args is not None else ask("Private key file (privkey.pem)", tls.get("key")))
-        if os.path.isfile(cert or "") and os.path.isfile(key or ""):
-            tls.update({"enabled": True, "cert": os.path.abspath(cert), "key": os.path.abspath(key)})
-        else:
-            fail("Certificate or key file not found - TLS stays off.")
-            tls["enabled"] = False
+    cert_in_use = apply_server_tls(cfg, tls_mode, address, cert or "", key or "")
     save_json(config_path("server"), cfg)
     ok("Settings saved: %s" % config_path("server"))
     if IS_LINUX and is_root():
@@ -723,22 +741,24 @@ def setup_server(args=None):
     except Exception as e:  # noqa: BLE001
         fail("Could not install the service: %s" % e)
     time.sleep(2)
-    scheme = "https" if tls["enabled"] else "http"
     host = address or (local_ips() or ["SERVER-IP"])[0]
+    scheme = "https" if cfg["tls"]["mode"] == "files" else "http"
     print()
     print(bold(green("  Done! Web panel:")))
     print("    " + bold("%s://%s:%s" % (scheme, host, cfg["port"])) + "   login: %s" % admin_user)
+    if cert_in_use and scheme == "http":
+        print(dim("    (https://%s:%s works too - the browser warns once about the self-signed certificate)"
+                  % (host, cfg["port"])))
     print()
     print(bold("  On every webcam system, choose \"This system is a CAMERA\" and enter:"))
     print("    Address : %s" % host)
     print("    Port    : %s" % cfg["port"])
     print("    Username: %s" % cam_user)
     print("    Password: (the camera password you chose)")
-    print("    TLS     : %s" % ("yes" if tls["enabled"] else "no"))
-    if tls["enabled"]:
-        fp = cert_fingerprint_file(tls["cert"])
-        if fp:
-            print(dim("    Certificate fingerprint: %s" % fp))
+    print("    Encryption is automatic: %s" % ("TLS" if cert_in_use else "OFF on this server"))
+    fp = certs.fingerprint_file(cert_in_use) if cert_in_use else ""
+    if fp:
+        print(dim("    Certificate fingerprint: %s" % fp))
     if not IS_WINDOWS:
         print(dim("  If your VPS provider has its own firewall, allow TCP port %s there too." % cfg["port"]))
 
@@ -757,8 +777,8 @@ def manage_servers():
             print(dim("   (none)"))
         for i, s in enumerate(cfg["servers"], 1):
             share = "all cameras" if s.get("cameras", "all") == "all" else "%d camera(s)" % len(s["cameras"])
-            print("  %2d) %s:%s  user %s%s  - %s%s" % (i, s["address"], s["port"], s["username"],
-                                                     "  TLS" if s.get("tls") else "", share,
+            print("  %2d) %s:%s  user %s  %s  - %s%s" % (i, s["address"], s["port"], s["username"],
+                                                       tls_label(s), share,
                                                      "" if s.get("enabled", True) else dim("  (disabled)")))
         print()
         print("   a) Add a server    r) Remove a server    t) Test connections    0) Back")
@@ -808,21 +828,23 @@ def manage_cameras():
 
 
 def manage_server():
+    from .server import load_config
     path = config_path("server")
-    cfg = load_json(path)
-    if not cfg:
+    if not load_json(path):
         warn("Set this system up as a server first (option 2).")
         return
+    cfg = load_config(path)
     while True:
         title("Server settings")
-        print("   Port %s, TLS %s, address %s" % (cfg["port"], "on" if (cfg.get("tls") or {}).get("enabled") else "off",
+        print("   Port %s, TLS %s, address %s" % (cfg["port"], SERVER_TLS_LABELS[cfg["tls"]["mode"]],
                                                  cfg.get("public_address") or "-"))
         print("   Camera accounts: %s" % (", ".join(a["username"] for a in cfg["camera_accounts"]) or "-"))
         print("   Panel users    : %s" % (", ".join("%s (%s)" % (u["username"], u["role"]) for u in cfg["users"]) or "-"))
         print()
         print("   1) Add a camera account          2) Change a camera account password")
         print("   3) Add a panel user (admin)      4) Reset a panel user password")
-        print("   5) Change the port               6) Run the full server setup again")
+        print("   5) Change the port               6) Encryption (TLS)")
+        print("   7) Run the full server setup again")
         print("   0) Back")
         ch = ask("Choose", "0")
         changed = False
@@ -865,6 +887,20 @@ def manage_server():
             warn("Update the port on every camera system too.")
             changed = True
         elif ch == "6":
+            print("    1) Automatic - self-signed certificate (recommended)")
+            print("    2) My own certificate files")
+            print("    3) Off")
+            mode = {"1": "auto", "2": "files", "3": "off"}.get(
+                ask("Choose", {"auto": "1", "files": "2", "off": "3"}[cfg["tls"]["mode"]]), "auto")
+            cert = key = ""
+            if mode == "files":
+                cert = ask("Certificate file (fullchain.pem)", cfg["tls"].get("cert"))
+                key = ask("Private key file (privkey.pem)", cfg["tls"].get("key"))
+            apply_server_tls(cfg, mode, cfg.get("public_address", ""), cert, key)
+            warn("If the certificate changed, camera systems that pinned the old one must forget it "
+                 "(camera panel > Servers > Edit).")
+            changed = True
+        elif ch == "7":
             setup_server()
             return
         elif ch == "0":
@@ -1093,7 +1129,8 @@ def main(argv=None):
     sc.add_argument("--server", help="host:port")
     sc.add_argument("--server-user")
     sc.add_argument("--server-password")
-    sc.add_argument("--server-tls", action="store_true")
+    sc.add_argument("--server-tls", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
+                    help="encryption of the link: auto (default, TLS when the server offers it), on, off")
     sc.add_argument("--record-path")
     ss = sub.add_parser("setup-server", help="set this system up as a server (non-interactive with options)")
     ss.add_argument("--port", type=int)
@@ -1102,7 +1139,7 @@ def main(argv=None):
     ss.add_argument("--admin-user")
     ss.add_argument("--admin-password")
     ss.add_argument("--address")
-    ss.add_argument("--tls", choices=["none", "self-signed", "files"])
+    ss.add_argument("--tls", choices=sorted(TLS_ARG), help="auto/self-signed (default), files, off/none")
     ss.add_argument("--cert")
     ss.add_argument("--key")
     for name, hlp in (("status", "show status"), ("restart", "restart services"), ("start", "start services"),
