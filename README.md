@@ -254,6 +254,10 @@ upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webca
 
 ## Changes
 
+- **Android camera 1.0.1** - fixes the app closing as soon as it was opened while the camera ran (a
+  status line was passed through String.format and "86%," broke it); errors on the screen or in the
+  service are logged instead of stopping the app; a crash report is shown on the next start and
+  "Copy log" sends everything needed for help.
 - **Android camera 1.0.0** - phones as cameras (see above).
 - **1.2.0** - Smooth, low-delay video. HD webcams capture in MJPEG at the webcam's own rate (raw YUYV
   1280x720 does not fit through USB 2.0 - a real webcam delivered 4 fps that way, ~15 with MJPEG);

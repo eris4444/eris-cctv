@@ -34,6 +34,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import ir.eris.cctv.core.ServerLink
+import ir.eris.cctv.core.StatusText
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -76,6 +77,7 @@ class MainActivity : Activity() {
         window.navigationBarColor = BG
         setContentView(build())
         load()
+        showLastCrash()
         if (settings.running && settings.configured && CameraService.instance == null && hasCamera()) {
             CameraService.start(this)
         }
@@ -178,6 +180,7 @@ class MainActivity : Activity() {
             typeface = Typeface.MONOSPACE
         }
         root.addView(card(logView))
+        root.addView(button("Copy log (to send it for help)") { copyLog() }, full())
         return ScrollView(this).apply {
             setBackgroundColor(BG)
             addView(root)
@@ -454,7 +457,11 @@ class MainActivity : Activity() {
             startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                 Uri.parse("package:$packageName")))
         } catch (_: Exception) {
-            startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+                toast("Open the phone's battery settings and set Eris CCTV to \"No restrictions\"")
+            }
         }
     }
 
@@ -478,6 +485,7 @@ class MainActivity : Activity() {
         thread {
             val r = ServerLink.test(cfg, host)
             ui.post {
+                if (isFinishing || isDestroyed) return@post   // the screen was left meanwhile
                 val msg = if (r["ok"] == true) {
                     "Connected to \"${r["server_name"]}\" - " + (if (r["secure"] == true) "encrypted (TLS)"
                     else if (r["server_tls"] == true) "NOT encrypted" else "NOT encrypted: the server has no TLS (older than 1.1)")
@@ -498,47 +506,73 @@ class MainActivity : Activity() {
 
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
 
+    private fun copy(label: String, text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+        toast("Copied")
+    }
+
+    /** If the app stopped unexpectedly last time, show why (saved by App) so it can be reported. */
+    private fun showLastCrash() {
+        try {
+            val f = java.io.File(filesDir, App.CRASH_FILE)
+            if (!f.exists()) return
+            val text = f.readText()
+            f.renameTo(java.io.File(filesDir, App.SEEN_FILE))
+            CameraService.log("the app stopped unexpectedly last time - see the report")
+            AlertDialog.Builder(this)
+                .setTitle("The app stopped last time")
+                .setMessage("Please send this report (Copy) so it can be fixed. The camera itself keeps working.\n\n" +
+                    text.take(3000))
+                .setPositiveButton("Copy") { _, _ -> copy("Eris CCTV crash", text) }
+                .setNegativeButton("Close", null)
+                .show()
+        } catch (_: Exception) { }
+    }
+
+    private fun copyLog() {
+        val lines = synchronized(CameraService.logLines) { CameraService.logLines.toList() }
+        val status = CameraService.instance?.status()?.toString() ?: "service stopped"
+        val crash = try { java.io.File(filesDir, App.SEEN_FILE).takeIf { it.exists() }?.readText() } catch (_: Exception) { null }
+        copy("Eris CCTV log", "Eris CCTV camera ${BuildInfo.VERSION} - Android ${Build.VERSION.RELEASE} (API " +
+            "${Build.VERSION.SDK_INT}) - ${Build.MANUFACTURER} ${Build.MODEL}\nstatus: $status\n\n" +
+            lines.joinToString("\n") + (if (crash != null) "\n\nlast crash:\n$crash" else ""))
+    }
+
     /** "Battery 86%, charging, 34 C" - worth watching on a phone that films all day. */
     private fun battery(): String {
-        val b = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return ""
-        val level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
-        val scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
-        val plugged = b.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0
-        val temp = b.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0
-        val hot = if (temp >= 45) "  - hot! give the phone some air or lower the quality" else ""
-        return "Battery ${level * 100 / maxOf(scale, 1)}%, ${if (plugged) "charging" else "NOT charging"}, %.0f C".format(temp) + hot
+        return try {
+            val b = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return ""
+            val level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+            val scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
+            val plugged = b.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0
+            val temp = b.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0
+            StatusText.battery(level * 100 / maxOf(scale, 1), plugged, temp)
+        } catch (e: Exception) {
+            ""
+        }
     }
 
     // ---------------------------------------------------------------------------- status
     private val refresh = object : Runnable {
         override fun run() {
-            val svc = CameraService.instance
-            if (svc == null) {
-                statusView.text = if (settings.configured) "Stopped - press Start camera." else
-                    "Enter the server details below (the camera account from the server setup), then press Start camera."
-                startButton.text = "Start camera"
-            } else {
-                val s = svc.status()
-                val server = when (s["server"]) {
-                    "connected" -> "Connected to ${s["server_name"]} " + (if (s["secure"] == true) "(encrypted)" else "(NOT encrypted)")
-                    "error" -> "Server: ${s["error"]}"
-                    "none" -> "No server set up"
-                    else -> "Connecting to ${settings.address}:${settings.port}..."
+            // a mistake in a status line must never take the app (and with it the camera service) down
+            try {
+                val svc = CameraService.instance
+                if (svc == null) {
+                    statusView.text = if (settings.configured) "Stopped - press Start camera." else
+                        "Enter the server details below (the camera account from the server setup), then press Start camera."
+                    startButton.text = "Start camera"
+                } else {
+                    statusView.text = StatusText.service(svc.status(), settings.address, settings.port, settings.fps, battery())
+                    startButton.text = "Stop camera"
                 }
-                val cam = when (s["camera"]) {
-                    "running" -> "Camera on ${s["size"]} @ ${settings.fps} fps, ${s["frames"]} frames"
-                    "starting" -> "Camera starting..."
-                    "error" -> "Camera problem: ${s["camera_error"]}"
-                    else -> "Camera ready - it turns on when somebody watches"
-                }
-                val sent = (s["sent"] as Long) / 1024.0 / 1024.0
-                statusView.text = "$server\n$cam\nWatching now: ${s["watchers"]}\nSent: %.1f MB".format(sent) +
-                    (if ((s["dropped"] as Int) > 0) "  (skipped ${s["dropped"]} fragments - slow upload)" else "") +
-                    "\n" + battery()
-                startButton.text = "Stop camera"
+                val lines = synchronized(CameraService.logLines) { CameraService.logLines.toList() }
+                logView.text = lines.takeLast(12).reversed().joinToString("\n")
+            } catch (e: Throwable) {
+                statusView.text = "Could not show the status: $e"
+                CameraService.log("status screen: $e")
             }
-            val lines = synchronized(CameraService.logLines) { CameraService.logLines.toList() }
-            logView.text = lines.takeLast(12).reversed().joinToString("\n")
             ui.postDelayed(this, 1000)
         }
     }

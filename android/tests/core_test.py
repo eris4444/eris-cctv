@@ -97,6 +97,21 @@ async def main():
     jar = build.build_core() if not os.environ.get("CORE_JAR") else os.environ["CORE_JAR"]
     h264, aac = make_inputs(ffmpeg)
 
+    print("status screen text (the 1.0.0 crash), Persian locale")
+    st = await ajvm(jar, "status")
+    check(st["old_pattern_throws"], "the 1.0.0 battery line throws (%s) - the crash on every start"
+          % st["old_pattern_throws"])
+    check(st["battery"] == "Battery 86%, charging, 34 C", "battery line: %s" % st["battery"])
+    check("hot!" in st["battery_hot"] and "NOT charging" in st["battery_hot"], "hot battery warning")
+    c = st["connected"]
+    check("Connected to Eris 100% CCTV %s %d (encrypted)" in c and "Sent: 1.5 MB" in c and "Watching now: 2" in c
+          and "1280x720 @ 15 fps, 1234 frames" in c and c.endswith("Battery 86%, charging, 34 C"),
+          "status while streaming, '%' in the server name, ASCII digits")
+    e = st["error"]
+    check("Server: 100%, broken %n %, c" in e and "(skipped 3 fragments" in e and "in use (50%)" in e,
+          "status with errors that contain '%'")
+    check(st["connecting"].startswith("Connecting to panel.example.ir:8800..."), "status while connecting")
+
     print("Mp4Muxer output")
     out = os.path.join(HOME, "mux.mp4")
     st = await ajvm(jar, "mux", h264, aac, out, FPS, 0)

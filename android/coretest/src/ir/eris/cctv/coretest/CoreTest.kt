@@ -5,6 +5,7 @@ import ir.eris.cctv.core.LinkHost
 import ir.eris.cctv.core.Mp4Muxer
 import ir.eris.cctv.core.ServerConfig
 import ir.eris.cctv.core.ServerLink
+import ir.eris.cctv.core.StatusText
 import java.io.File
 import java.io.FileOutputStream
 
@@ -19,6 +20,7 @@ import java.io.FileOutputStream
  */
 fun main(args: Array<String>) {
     when (args[0]) {
+        "status" -> statusChecks()
         "test" -> {
             val host = Host(Muxed(null))
             println(Json.encode(ServerLink.test(cfg(args), host)))
@@ -53,6 +55,28 @@ fun main(args: Array<String>) {
 }
 
 private fun cfg(a: Array<String>) = ServerConfig(a[1], a[2].toInt(), a[3], a[4], tlsMode = a[5])
+
+/** The main screen's status lines (the 1.0.0 crash) under a Persian locale, with '%' in server texts. */
+private fun statusChecks() {
+    java.util.Locale.setDefault(java.util.Locale("fa", "IR"))
+    val out = LinkedHashMap<String, Any?>()
+    out["old_pattern_throws"] = try {
+        @Suppress("FormatStringAnnotation")
+        "Battery 86%, charging, %.0f C".format(34.0)
+        false
+    } catch (e: Exception) {
+        e.javaClass.simpleName
+    }
+    out["battery"] = StatusText.battery(86, true, 34.4)
+    out["battery_hot"] = StatusText.battery(100, false, 46.0)
+    out["connected"] = StatusText.service(mapOf("server" to "connected", "server_name" to "Eris 100% CCTV %s %d",
+        "secure" to true, "sent" to 1_572_864L, "dropped" to 0, "watchers" to 2, "camera" to "running",
+        "size" to "1280x720", "frames" to 1234L), "panel.example.ir", 8800, 15, StatusText.battery(86, true, 34.4))
+    out["error"] = StatusText.service(mapOf("server" to "error", "error" to "100%, broken %n %, c", "camera" to "error",
+        "camera_error" to "the camera is in use (50%)", "sent" to 0L, "dropped" to 3, "watchers" to 0), "h", 1, 10, "")
+    out["connecting"] = StatusText.service(mapOf("server" to "connecting", "camera" to "idle"), "panel.example.ir", 8800, 15, "")
+    println(Json.encode(out))
+}
 
 class Muxed(private val out: FileOutputStream?) {
     var muxer: Mp4Muxer? = null

@@ -175,18 +175,33 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     // ---------------------------------------------------------------------------- camera control
     private val tick = object : Runnable {
         override fun run() {
-            val now = System.currentTimeMillis()
-            val wanted = watchers.isNotEmpty() || settings.keepCameraOn || preview != null
-            if (wanted && capture == null && now >= retryAt) ensureCapture()
-            if (!wanted && capture != null && stopCaptureAt in 1..now) {
-                log("nobody is watching - camera off")
-                stopCapture()
+            // anything thrown here would stop the whole app, camera included: log it and keep going
+            try {
+                val now = System.currentTimeMillis()
+                val wanted = watchers.isNotEmpty() || settings.keepCameraOn || preview != null
+                if (wanted && capture == null && now >= retryAt) ensureCapture()
+                if (!wanted && capture != null && stopCaptureAt in 1..now) {
+                    log("nobody is watching - camera off")
+                    stopCapture()
+                }
+                if (wanted) stopCaptureAt = 0
+                else if (capture != null && stopCaptureAt == 0L) stopCaptureAt = now + IDLE_STOP_MS
+                refreshNotification()
+            } catch (e: Throwable) {
+                log("service: $e")
+                try { capture?.stop() } catch (_: Throwable) { }
+                capture = null
+                retryAt = System.currentTimeMillis() + 10_000
             }
-            if (wanted) stopCaptureAt = 0
-            else if (capture != null && stopCaptureAt == 0L) stopCaptureAt = now + IDLE_STOP_MS
-            refreshNotification()
             main.postDelayed(this, 1000)
         }
+    }
+
+    /** Runs on the main thread; an error is logged instead of stopping the app (and the camera). */
+    private fun safe(block: () -> Unit) {
+        main.post(Runnable {
+            try { block() } catch (e: Throwable) { log("service: $e") }
+        })
     }
 
     private fun ensureCapture() {
@@ -220,7 +235,7 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     val pictureRotation: Int get() = capture?.rotation ?: 0
 
     fun setPreview(surface: Surface?) {
-        main.post {
+        safe {
             preview = surface
             if (surface != null) ensureCapture()
             capture?.setPreview(surface)
@@ -242,7 +257,7 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     }
 
     override fun onCaptureState(state: String, error: String) {
-        main.post {
+        safe {
             captureState = state
             captureError = error
             if (state == "error") {
@@ -267,7 +282,7 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     override fun initFor(slot: Int): ByteArray? = init
 
     override fun onSubscribe(link: ServerLink, slot: Int) {
-        main.post {
+        safe {
             watchers.add("${link.cfg.address}#$slot")
             ensureCapture()
             capture?.requestKeyFrame()
@@ -276,7 +291,7 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     }
 
     override fun onUnsubscribe(link: ServerLink, slot: Int) {
-        main.post { watchers.remove("${link.cfg.address}#$slot") }
+        safe { watchers.remove("${link.cfg.address}#$slot") }
     }
 
     override fun onPinChanged(link: ServerLink, pin: String) {
@@ -284,7 +299,7 @@ class CameraService : Service(), LinkHost, Capture.Listener {
     }
 
     override fun onLinkState(link: ServerLink) {
-        main.post { refreshNotification() }
+        safe { refreshNotification() }
     }
 
     override fun log(message: String) = Companion.log(message)

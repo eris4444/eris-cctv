@@ -195,6 +195,15 @@ class Capture(private val context: Context, private val opt: Options, private va
         try { session?.close() } catch (_: Exception) { }
         session = null
         val targets = listOfNotNull(enc, preview)
+        try {
+            createSession(dev, targets)
+        } catch (e: Exception) {
+            // on the camera thread an uncaught error would stop the whole app
+            fail("camera session: " + (e.message ?: e.javaClass.simpleName))
+        }
+    }
+
+    private fun createSession(dev: CameraDevice, targets: List<Surface>) {
         @Suppress("DEPRECATION")
         dev.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
