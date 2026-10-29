@@ -192,6 +192,8 @@ unencrypted link only for servers that never had TLS; `--server-tls` alone means
 - **No webcam found (Linux):** check `ls /dev/video*`; the agent runs as root so permissions are not
   an issue. Raspberry Pi ribbon cameras need `libcamera`'s V4L2 compatibility layer; USB webcams work
   directly.
+- **Low frame rate:** since 1.2 HD sizes use the webcam's MJPEG mode automatically. In dim light many
+  webcams lower their frame rate by themselves (longer exposure) - more light helps more than settings.
 - **Camera shows an error:** open *Cameras -> Log* in the camera panel to see the ffmpeg messages.
   Lower the resolution or frame rate if the webcam does not support the chosen mode.
 - **Camera system cannot reach the server:** the camera panel's *Servers* page shows the exact
@@ -228,6 +230,12 @@ upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webca
 
 ## Changes
 
+- **1.2.0** - Smooth, low-delay video. HD webcams capture in MJPEG at the webcam's own rate (raw YUYV
+  1280x720 does not fit through USB 2.0 - a real webcam delivered 4 fps that way, ~15 with MJPEG);
+  fragments of 2 frames (~130 ms) instead of one per second, so the delay drops from ~2 s to ~0.5 s;
+  slow links and slow viewers skip ahead only to keyframes (no broken picture); recordings start at a
+  keyframe; the player stays ~0.3 s behind live by adjusting its speed instead of jumping. Update the
+  camera systems and the servers.
 - **1.1.2** - Works behind a CDN (ArvanCloud, Cloudflare): a pinned certificate that is renewed and
   valid for the name from a public CA is followed automatically. README: CDN setup.
 - **1.1.1** - A camera system that fell back to an unencrypted link (server still on 1.0) switches to

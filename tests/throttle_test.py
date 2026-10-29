@@ -158,7 +158,7 @@ async def watch_for(port, path, cookie, seconds):
                 break
             if isinstance(msg, bytes) and msg[0] == 1:
                 init = True
-            elif isinstance(msg, bytes) and msg[0] == 2 and init:
+            elif isinstance(msg, bytes) and msg[0] in (2, 3) and init:
                 frags += 1
     finally:
         await ws.close()
@@ -217,10 +217,13 @@ async def main():
     check(await wait_connected(link, 20), "agent connected through the throttling network")
     view = "/api/view/%s/%s" % (agent.agent_id, cam["id"])
 
+    frag_s = max(2.0 / cam["fps"], 0.1)  # video per fragment (see camera.build_command)
+
     print("A: encryption off, plain uploads throttled to 5 KB/s and reset after 20 s")
     init, frags = await watch_for(SERVER_PORT, view, cookie, 26)
-    print("    init=%s fragments=%d resets=%d" % (init, frags, net.resets))
-    check(frags <= 4 and net.resets >= 1, "unencrypted: video barely moves and the link is reset (the old bug)")
+    print("    init=%s fragments=%d (%.1f s of video) resets=%d" % (init, frags, frags * frag_s, net.resets))
+    check(frags * frag_s <= 4 and net.resets >= 1,
+          "unencrypted: video barely moves and the link is reset (the old bug)")
 
     print("B: automatic encryption through the same network")
     link = await relink(agent, tls_mode="auto")
@@ -229,7 +232,7 @@ async def main():
     resets = net.resets
     init, frags = await watch_for(SERVER_PORT, view, cookie, 20)
     print("    init=%s fragments=%d resets=%d" % (init, frags, net.resets - resets))
-    check(init and frags >= 14, "TLS: video flows normally (%d fragments in 20 s)" % frags)
+    check(init and frags * frag_s >= 14, "TLS: video flows normally (%.1f s of video in 20 s)" % (frags * frag_s))
     check(net.resets == resets and link.state == "connected", "no resets, link stays up")
 
     print("C: automatic encryption, server without TLS (like 1.0)")
@@ -239,7 +242,7 @@ async def main():
     check(not link.secure and not link.server_tls, "fell back to an unencrypted link")
     _, _, ocookie = await ahttp(OLD_SERVER_PORT, "POST", "/api/login", {"username": "admin", "password": "adminpass"})
     init, frags = await watch_for(OLD_SERVER_PORT, view, ocookie, 8)
-    check(init and frags >= 4, "video flows (%d fragments)" % frags)
+    check(init and frags * frag_s >= 4, "video flows (%.1f s of video in 8 s)" % (frags * frag_s))
 
     print("C2: that server is updated (TLS on the same port) while the camera stays connected")
     old_server._stop.set()
@@ -264,7 +267,7 @@ async def main():
     print("    fragments=%d skipped=%d queued=%d bytes, written to the socket %d KB, camera %s bit/s"
           % (frags, link.dropped, link._queued, (link.bytes_sent - sent0) // 1024,
              agent.cameras[cam["id"]].bitrate()))
-    check(init and frags >= 2, "video keeps arriving (%d fragments)" % frags)
+    check(init and frags * frag_s >= 0.4, "video keeps arriving (%d fragments)" % frags)
     check(link.dropped > 0, "old fragments skipped instead of piling up (%d)" % link.dropped)
     check(link._queued < 400000, "send queue stays short (%d bytes)" % link._queued)
 

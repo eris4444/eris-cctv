@@ -85,11 +85,16 @@ async def watch(port, path, cookie, want_frags=3, timeout=40, tls=False):
                 metas.append(json.loads(msg))
             elif msg[0] == 1:
                 init = msg[1:]
-            elif msg[0] == 2 and init is not None:
+                KINDS.clear()
+            elif msg[0] in (2, 3) and init is not None:
                 frags += 1
+                KINDS.append((msg[0], time.time()))
     finally:
         await ws.close()
     return metas, init, frags
+
+
+KINDS = []  # (message kind, arrival time) of the fragments seen by the last watch()
 
 
 async def main():
@@ -154,6 +159,14 @@ async def main():
         check(info["audio"] == "mp4a.40.2", "audio track present (%s)" % info["audio"])
     check(frags >= 3, "%d media fragments received" % frags)
     check(any(m.get("online") for m in metas), "meta says online")
+    metas, init, frags = await watch(SERVER_PORT, "/api/view/%s/%s" % (agent_id, cam_id), cookie, want_frags=30)
+    span = KINDS[-1][1] - KINDS[0][1]
+    keys = sum(1 for k, _t in KINDS if k == 3)
+    check(KINDS[0][0] == 3, "a viewer's first fragment starts with a keyframe")
+    check(span > 0 and (len(KINDS) - 1) / span >= 4,
+          "small fragments for low delay: %.1f per second" % ((len(KINDS) - 1) / max(span, 0.001)))
+    check(2 <= keys <= span + 2 and keys < len(KINDS) / 2, "keyframe about once a second (%d of %d fragments in %.1fs)"
+          % (keys, len(KINDS), span))
 
     print("TLS and plain HTTP on the same port")
     status, body = await asyncio.get_running_loop().run_in_executor(None, https_get, SERVER_PORT, "/api/session")

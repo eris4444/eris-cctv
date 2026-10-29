@@ -9,8 +9,8 @@ CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"mvex", b"u
 class Mp4Splitter:
     """Feeds raw fMP4 bytes, returns ('init', bytes) and ('frag', bytes) items.
 
-    ffmpeg with -movflags frag_keyframe+empty_moov+default_base_moof writes ftyp+moov once, then
-    moof+mdat pairs; each fragment starts with a video keyframe.
+    ffmpeg with -movflags frag_keyframe+empty_moov+default_base_moof (+ -frag_duration) writes
+    ftyp+moov once, then moof+mdat pairs; only some fragments start with a keyframe - see KeyframeDetector.
     """
 
     def __init__(self):
@@ -78,6 +78,99 @@ def _sample_entries(data: bytes, start: int, end: int):
             yield from _sample_entries(data, ps, pe)
         elif btype == b"stsd":
             yield from iter_boxes(data, ps + 8, pe)
+
+
+NON_SYNC = 0x00010000  # sample_is_non_sync_sample in ISO BMFF sample flags
+
+
+class KeyframeDetector:
+    """Tells whether a fragment starts with a video keyframe (a point a decoder can start from).
+
+    Fragments may be dropped (slow link, slow viewer) only up to the next keyframe fragment, and new
+    viewers and recordings must start at one.
+    """
+
+    def __init__(self, init: bytes):
+        self.track = 0
+        self.default_flags = None
+        try:
+            self._read_init(init)
+        except (struct.error, IndexError):
+            self.track = 0
+
+    def _read_init(self, init: bytes) -> None:
+        trex = {}
+        for btype, ps, pe in iter_boxes(init):
+            if btype != b"moov":
+                continue
+            for t, tps, tpe in iter_boxes(init, ps, pe):
+                if t == b"trak":
+                    track, handler = self._trak(init, tps, tpe)
+                    if handler == b"vide" and not self.track:
+                        self.track = track
+                elif t == b"mvex":
+                    for x, xps, _xpe in iter_boxes(init, tps, tpe):
+                        if x == b"trex":
+                            trex[struct.unpack_from(">I", init, xps + 4)[0]] = \
+                                struct.unpack_from(">I", init, xps + 20)[0]
+        self.default_flags = trex.get(self.track)
+
+    @staticmethod
+    def _trak(data: bytes, start: int, end: int):
+        track, handler = 0, b""
+        for t, ps, pe in iter_boxes(data, start, end):
+            if t == b"tkhd":
+                track = struct.unpack_from(">I", data, ps + (20 if data[ps] == 1 else 12))[0]
+            elif t == b"mdia":
+                for m, mps, _mpe in iter_boxes(data, ps, pe):
+                    if m == b"hdlr":
+                        handler = bytes(data[mps + 8:mps + 12])
+        return track, handler
+
+    def is_key(self, frag: bytes) -> bool:
+        """True when unsure, so a parsing problem never blocks the stream."""
+        if not self.track:
+            return True
+        try:
+            flags = self._first_sample_flags(frag)
+        except (struct.error, IndexError):
+            return True
+        return flags is None or not flags & NON_SYNC
+
+    def _first_sample_flags(self, frag: bytes):
+        for btype, ps, pe in iter_boxes(frag):
+            if btype != b"moof":
+                continue
+            for t, tps, tpe in iter_boxes(frag, ps, pe):
+                if t != b"traf":
+                    continue
+                default, trun = self.default_flags, None
+                track = None
+                for b, bps, _bpe in iter_boxes(frag, tps, tpe):
+                    if b == b"tfhd":
+                        tf = struct.unpack_from(">I", frag, bps)[0] & 0xFFFFFF
+                        track = struct.unpack_from(">I", frag, bps + 4)[0]
+                        pos = bps + 8
+                        pos += 8 if tf & 0x01 else 0
+                        pos += 4 if tf & 0x02 else 0
+                        pos += 4 if tf & 0x08 else 0
+                        pos += 4 if tf & 0x10 else 0
+                        if tf & 0x20:
+                            default = struct.unpack_from(">I", frag, pos)[0]
+                    elif b == b"trun" and trun is None:
+                        trun = bps
+                if track != self.track or trun is None:
+                    continue
+                tr = struct.unpack_from(">I", frag, trun)[0] & 0xFFFFFF
+                pos = trun + 8 + (4 if tr & 0x01 else 0)
+                if tr & 0x04:
+                    return struct.unpack_from(">I", frag, pos)[0]
+                if tr & 0x400:
+                    pos += 4 if tr & 0x100 else 0
+                    pos += 4 if tr & 0x200 else 0
+                    return struct.unpack_from(">I", frag, pos)[0]
+                return default
+        return None
 
 
 def codec_info(init: bytes) -> dict:

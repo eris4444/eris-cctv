@@ -241,17 +241,18 @@ def list_modes(ffmpeg: str, dev: dict) -> list:
             cmd += ["-video_device_number", str(int(dev["index"]))]
         out = _run(cmd + ["-i", "video=" + dev["name"]])
         for line in out.splitlines():
-            m = re.search(r"(vcodec|pixel_format)=(\S+)\s+min s=\d+x\d+ fps=[\d.]+\s+"
+            m = re.search(r"(vcodec|pixel_format)=(\S+)\s+min s=\d+x\d+ fps=([\d.]+)\s+"
                           r"max s=(\d+)x(\d+) fps=([\d.]+)", line)
             if not m:
                 continue
             fmt = m.group(2)
             if m.group(1) == "vcodec" and fmt != "mjpeg":
                 continue
-            w, h, fps = int(m.group(3)), int(m.group(4)), int(float(m.group(5)))
+            w, h = int(m.group(4)), int(m.group(5))
+            low, fps = int(float(m.group(3))), int(float(m.group(6)))
             k = (fmt, w, h)
             if k not in modes or modes[k]["fps"] < fps:
-                modes[k] = {"format": fmt, "width": w, "height": h, "fps": fps}
+                modes[k] = {"format": fmt, "width": w, "height": h, "fps": fps, "min_fps": low}
     return sorted(modes.values(), key=lambda m: (-m["width"] * m["height"], m["format"]))
 
 
@@ -279,12 +280,19 @@ def default_size(modes: list):
 
 
 def pick_input(modes: list, width: int, height: int, fps: int):
-    """Choose input pixel format and frame rate for a size: ('auto'|'mjpeg'|raw fmt, fps)."""
+    """Choose input pixel format and frame rate for a size: ('auto'|'mjpeg'|raw fmt, fps).
+
+    Above 640x480 MJPEG wins: raw HD video does not fit through USB 2.0 (1280x720 YUYV at 15 fps
+    needs ~28 MB/s, the bus carries ~24), so such a webcam really delivers only a few frames a second.
+    """
     same = [m for m in modes if m["width"] == width and m["height"] == height]
     if not same:
         return "auto", fps
     raw = [m for m in same if m["format"] != "mjpeg"]
     mjpeg = [m for m in same if m["format"] == "mjpeg"]
+    if mjpeg and width * height > 640 * 480:
+        m = mjpeg[0]
+        return "mjpeg", min(fps, m["fps"]) if m["fps"] else fps
     for m in raw:
         if m["fps"] >= fps or (m["fps"] == 0 and width * height <= 640 * 480):
             return m["format"], fps
@@ -293,3 +301,14 @@ def pick_input(modes: list, width: int, height: int, fps: int):
         return "mjpeg", min(fps, m["fps"]) if m["fps"] else fps
     m = raw[0]
     return m["format"], min(fps, m["fps"]) if m["fps"] else fps
+
+
+def capture_rate(modes: list, fmt: str, width: int, height: int, fps: int) -> int:
+    """Frame rate to ask the webcam for. DirectShow refuses rates outside a mode's range (this HK 5M CAM
+    offers MJPEG 1280x720 only at exactly 30), so ask for the mode's rate and let ffmpeg's fps filter
+    bring it down to the configured one."""
+    for m in modes:
+        if m["format"] == fmt and m["width"] == width and m["height"] == height and m.get("fps"):
+            low = m.get("min_fps", m["fps"])
+            return fps if low <= fps <= m["fps"] else m["fps"]
+    return fps

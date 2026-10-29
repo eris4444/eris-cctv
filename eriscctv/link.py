@@ -206,8 +206,9 @@ class ServerLink:
         self.primed = set()
         self.ws = None
         self._task = None
-        self._queue = collections.deque()  # (queued at, kind, framed bytes)
+        self._queue = collections.deque()  # see _drop_gop
         self._queued = 0
+        self._gap_tail = set()  # camera slots whose queued stream ends in a gap (wait for a keyframe)
         self._wake = asyncio.Event()
         self._key_cache: dict = {}
         self._cams_dirty = asyncio.Event()
@@ -305,6 +306,7 @@ class ServerLink:
         self.primed.clear()
         self._queue.clear()
         self._queued = 0
+        self._gap_tail.clear()
 
     async def _session(self) -> None:
         plain_first = time.monotonic() < self._plain_until
@@ -360,6 +362,7 @@ class ServerLink:
             self.primed.discard(cam.id)
             if cam.init:
                 self._enqueue(KIND_INIT, cam.slot, cam.init, force=True)
+                self._gap_tail.add(cam.slot)  # start the server's copy at the next keyframe
                 self.primed.add(cam.id)
         elif t == "unsubscribe" and cam:
             self.subscribed.discard(cam.id)
@@ -375,49 +378,72 @@ class ServerLink:
     def on_init(self, cam, data: bytes) -> None:
         if cam.id in self.subscribed:
             self._enqueue(KIND_INIT, cam.slot, data, force=True)
+            self._gap_tail.add(cam.slot)
             self.primed.add(cam.id)
 
-    def on_frag(self, cam, data: bytes) -> None:
+    def on_frag(self, cam, data: bytes, key: bool = True) -> None:
         if cam.id in self.primed:
-            self._enqueue(KIND_FRAG, cam.slot, data)
+            self._enqueue(KIND_FRAG, cam.slot, data, key=key)
+
+    # Queue items: (queued at, kind, slot, starts with a keyframe, framed bytes). Fragments are only
+    # dropped together with the rest of their group of pictures: a decoder that misses a fragment shows
+    # garbage until the next keyframe, so the stream resumes exactly there.
+    def _drop_gop(self, items: list, i: int) -> None:
+        slot = items[i][2]
+        for j in range(i, len(items)):
+            it = items[j]
+            if it is None or it[2] != slot:
+                continue
+            if j > i and (it[1] == KIND_INIT or it[3]):
+                return  # the camera's stream continues cleanly from here
+            if it[1] == KIND_FRAG:
+                self.dropped += 1
+                self._queued -= len(it[4]) - 3
+                items[j] = None
+        self._gap_tail.add(slot)  # nothing clean queued yet: drop new fragments until a keyframe
 
     def _prune(self) -> None:
         """Forget fragments that waited longer than MAX_LAG while the sender was stuck on a slow link."""
         now = time.monotonic()
         if not self._queue or now - self._queue[0][0] <= MAX_LAG:
             return
-        keep = collections.deque()
-        for item in self._queue:
-            if item[1] == KIND_FRAG and now - item[0] > MAX_LAG:
-                self.dropped += 1
-                self._queued -= len(item[2]) - 3
-            else:
-                keep.append(item)
-        self._queue = keep
+        items = list(self._queue)
+        for i, it in enumerate(items):
+            if it is not None and it[1] == KIND_FRAG and now - it[0] > MAX_LAG:
+                self._drop_gop(items, i)
+        self._queue = collections.deque(it for it in items if it is not None)
 
-    def _enqueue(self, kind: int, slot: int, data: bytes, force: bool = False) -> None:
+    def _enqueue(self, kind: int, slot: int, data: bytes, force: bool = False, key: bool = True) -> None:
         self._prune()
+        if kind == KIND_INIT:
+            self._gap_tail.discard(slot)
+        elif slot in self._gap_tail:
+            if not key:
+                self.dropped += 1
+                return
+            self._gap_tail.discard(slot)
         if not force and self._queued + len(data) > MAX_QUEUE_BYTES:
             self.dropped += 1
+            self._gap_tail.add(slot)
             return
-        self._queue.append((time.monotonic(), kind, struct.pack(">BH", kind, slot) + data))
+        self._queue.append((time.monotonic(), kind, slot, key, struct.pack(">BH", kind, slot) + data))
         self._queued += len(data)
         self._wake.set()
 
     async def _sender(self) -> None:
         """Sends queued media. On a link slower than the camera, fragments that waited longer than
-        MAX_LAG are skipped (each one starts with a keyframe), so viewers stay live instead of falling
-        minutes behind."""
+        MAX_LAG are skipped up to the next keyframe, so viewers stay live instead of falling minutes
+        behind."""
         try:
             while True:
                 await self._wake.wait()
                 self._wake.clear()
                 while self._queue and self.ws:
-                    queued_at, kind, item = self._queue.popleft()
+                    self._prune()
+                    if not self._queue:
+                        break
+                    item = self._queue.popleft()[4]
                     self._queued -= len(item) - 3
-                    if kind == KIND_FRAG and time.monotonic() - queued_at > MAX_LAG:
-                        self.dropped += 1
-                        continue
                     await self.ws.send_bytes(item)
                     self.bytes_sent += len(item)
         except WebSocketClosed:

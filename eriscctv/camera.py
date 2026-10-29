@@ -8,7 +8,8 @@ import os
 import re
 import time
 
-from .mp4 import Mp4Splitter, codec_info
+from .devices import capture_rate
+from .mp4 import KeyframeDetector, Mp4Splitter, codec_info
 from .util import IS_WINDOWS, ffmpeg_features, find_ffmpeg, font_file, h264_encoder, popen_kwargs
 
 log = logging.getLogger("camera")
@@ -26,6 +27,7 @@ def build_command(ffmpeg: str, cam: dict, use_audio: bool = True):
     w, h = int(cam.get("width") or 0), int(cam.get("height") or 0)
     fps = max(1, min(60, int(cam.get("fps") or 15)))
     fmt = cam.get("input_format") or "auto"
+    rate = capture_rate(cam.get("modes") or [], fmt, w, h, fps)
     feats = ffmpeg_features(ffmpeg)
 
     def queue(n):
@@ -38,7 +40,7 @@ def build_command(ffmpeg: str, cam: dict, use_audio: bool = True):
             args += ["-input_format", fmt]
         if w and h:
             args += ["-video_size", "%dx%d" % (w, h)]
-        args += ["-framerate", str(fps), "-i", dev["path"]]
+        args += ["-framerate", str(rate), "-i", dev["path"]]
     elif kind == "dshow":
         args += ["-f", "dshow", "-rtbufsize", "100M"] + queue(512)
         if fmt == "mjpeg":
@@ -47,7 +49,7 @@ def build_command(ffmpeg: str, cam: dict, use_audio: bool = True):
             args += ["-pixel_format", fmt]
         if w and h:
             args += ["-video_size", "%dx%d" % (w, h)]
-        args += ["-framerate", str(fps)]
+        args += ["-framerate", str(rate)]
         if int(dev.get("index", 0)):
             args += ["-video_device_number", str(int(dev["index"]))]
         spec = "video=" + dev["name"]
@@ -113,8 +115,12 @@ def build_command(ffmpeg: str, cam: dict, use_audio: bool = True):
     args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0", "-bf", "0"]
     if amap:
         args += ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "48000", "-af", "aresample=async=1000"]
+    # Small fragments (2 frames, at least 100 ms) instead of one per keyframe: the browser can only play a
+    # fragment once all of it has arrived, so 1-second fragments meant 1 s+ of delay and a picture that
+    # froze between fragments. A keyframe still comes every second for new viewers and recordings.
+    frag_us = int(max(2.0 / fps, 0.1) * 1000000)
     args += ["-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-             "-flush_packets", "1", "pipe:1"]
+             "-frag_duration", str(frag_us), "-flush_packets", "1", "pipe:1"]
     return args, cwd
 
 
@@ -177,10 +183,10 @@ class CameraWorker:
     def remove(self, sub) -> None:
         self.subs.discard(sub)
 
-    def _emit(self, method: str, data: bytes) -> None:
+    def _emit(self, method: str, *args) -> None:
         for sub in list(self.subs):
             try:
-                getattr(sub, method)(self, data)
+                getattr(sub, method)(self, *args)
             except Exception:
                 log.exception("subscriber error")
 
@@ -282,6 +288,7 @@ class CameraWorker:
             proc = self.proc
             err_task = asyncio.ensure_future(self._read_stderr(proc.stderr))
             splitter = Mp4Splitter()
+            keys = None
             reason = ""
             try:
                 while True:
@@ -300,6 +307,7 @@ class CameraWorker:
                         if kind == "init":
                             self.init = data
                             self.info = codec_info(data)
+                            keys = KeyframeDetector(data)
                             self.started_at = time.time()
                             got_video = True
                             if self._probe_video_only:
@@ -318,7 +326,7 @@ class CameraWorker:
                             self.frags += 1
                             self.bytes += len(data)
                             self._rate.append((now, len(data)))
-                            self._emit("on_frag", data)
+                            self._emit("on_frag", data, keys.is_key(data) if keys else True)
             except ValueError as e:
                 reason = "bad stream from ffmpeg: %s" % e
             finally:

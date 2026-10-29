@@ -14,6 +14,7 @@ import time
 
 from . import __version__, certs
 from .auth import ITERATIONS, Throttle, check_secret, make_secret, proof, same
+from .mp4 import KeyframeDetector
 from .panel import PanelAuth, need_admin, need_login
 from .util import (IS_WINDOWS, config_path, data_path, load_json, log_tail, new_id, remove_pid, save_json,
                    valid_name, write_pid)
@@ -66,9 +67,13 @@ def check_password(pw: str) -> str:
 
 
 class Viewer:
+    """A browser watching one camera. Binary messages: 1 init, 2 fragment, 3 fragment starting with a
+    keyframe; it starts at a keyframe and waits for the next one after a dropped fragment."""
+
     def __init__(self):
-        self.q: asyncio.Queue = asyncio.Queue(maxsize=48)
+        self.q: asyncio.Queue = asyncio.Queue(maxsize=64)
         self.primed = False
+        self.need_key = True
 
     def _put(self, item, force=False):
         try:
@@ -88,10 +93,16 @@ class Viewer:
         self._put((0, json.dumps(meta)), force=True)
         self._put((1, data), force=True)
         self.primed = True
+        self.need_key = True
 
-    def on_frag(self, data: bytes):
-        if self.primed:
-            self._put((2, data))
+    def on_frag(self, data: bytes, key: bool = True):
+        if not self.primed or (self.need_key and not key):
+            return
+        try:
+            self.q.put_nowait((3 if key else 2, data))
+            self.need_key = False
+        except asyncio.QueueFull:
+            self.need_key = True
 
 
 class AgentConn:
@@ -107,6 +118,7 @@ class AgentConn:
         self.cams: dict = {}      # slot -> camera info
         self.by_id: dict = {}     # camera id -> slot
         self.inits: dict = {}     # slot -> init segment
+        self.keys: dict = {}      # slot -> KeyframeDetector for that init
         self.subscribed = set()   # slots the agent is streaming to us
         self.bytes_in = 0
         self._rate = (time.monotonic(), 0, 0)  # (time, bytes_in, bytes/s) of the last sample
@@ -468,13 +480,16 @@ class Server:
         viewers = self.viewers.get(key, ())
         if kind == 1:
             conn.inits[slot] = payload
+            conn.keys[slot] = KeyframeDetector(payload)
             if viewers:
                 meta = self._meta(key)
                 for v in viewers:
                     v.on_init(meta, payload)
         elif kind == 2:
+            det = conn.keys.get(slot)
+            is_key = det.is_key(payload) if det else True
             for v in viewers:
-                v.on_frag(payload)
+                v.on_frag(payload, is_key)
 
     @staticmethod
     def _client_ip(req) -> str:

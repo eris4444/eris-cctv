@@ -131,6 +131,24 @@ def main():
     check([s["tls_mode"] for s in servers] == ["auto", "on"] and "tls" not in servers[0],
           "camera links: tls false -> automatic, tls true -> always")
 
+    print("== capture mode (HK 5M CAM, real list) ==")
+    hk = [{"format": "mjpeg", "width": 1280, "height": 720, "fps": 30, "min_fps": 30},
+          {"format": "yuyv422", "width": 1280, "height": 720, "fps": 15, "min_fps": 15},
+          {"format": "mjpeg", "width": 640, "height": 480, "fps": 30, "min_fps": 30},
+          {"format": "yuyv422", "width": 640, "height": 480, "fps": 30, "min_fps": 5}]
+    check(devices.pick_input(hk, 1280, 720, 15) == ("mjpeg", 15), "720p uses MJPEG (YUYV 720p gave 4 fps)")
+    check(devices.capture_rate(hk, "mjpeg", 1280, 720, 15) == 30, "asks the webcam for its own 30 fps")
+    check(devices.pick_input(hk, 640, 480, 15) == ("yuyv422", 15), "640x480 keeps raw YUYV")
+    check(devices.capture_rate(hk, "yuyv422", 640, 480, 15) == 15, "raw mode with a range gets 15 directly")
+    old_cam = os.path.join(HOME, "old-cam.json")
+    save_json(old_cam, {"agent_id": "abcd1234", "servers": [], "cameras": [
+        {"id": "c1", "width": 1280, "height": 720, "fps": 15, "input_format": "yuyv422", "modes": hk}]})
+    check(agent_mod.load_config(old_cam)["cameras"][0]["input_format"] == "mjpeg",
+          "an existing 720p camera on YUYV moves to MJPEG")
+    from eriscctv.camera import build_command
+    args, _ = build_command(cli.find_ffmpeg(), {"device": {"kind": "test"}, "width": 640, "height": 360, "fps": 15})
+    check(args[args.index("-frag_duration") + 1] == "133333", "fragments of 2 frames (133 ms at 15 fps)")
+
     print("== number parsing ==")
     check(cli.parse_numbers("1,3", 3) == [1, 3], "1,3")
     check(cli.parse_numbers(" 2 - 3 ", 3) == [2, 3], "range with spaces tolerated")

@@ -243,7 +243,7 @@ class LivePlayer {
   start() {
     this.stopped = false;
     this.connect();
-    this.timer = setInterval(() => this.tick(), 500);
+    this.timer = setInterval(() => this.tick(), 250);
   }
   stop() {
     this.stopped = true;
@@ -279,11 +279,25 @@ class LivePlayer {
       }
       return;
     }
+    /* binary: 1 = init segment, 2 = fragment, 3 = fragment that starts with a keyframe */
     const u8 = new Uint8Array(d);
     const kind = u8[0];
     const data = u8.subarray(1);
-    if (kind === 1) this.setup(data);
-    else if (kind === 2 && this.ms) { this.queue.push(data); this.pump(); }
+    if (kind === 1) { this.setup(data); return; }
+    if ((kind !== 2 && kind !== 3) || !this.ms) return;
+    const now = performance.now();
+    if (this.lastArrival) {
+      this.gaps.push(now - this.lastArrival);
+      if (this.gaps.length > 40) this.gaps.shift();
+    }
+    this.lastArrival = now;
+    const key = kind === 3;
+    if (this.needKey) {
+      if (!key) return;   /* after a gap the decoder can only restart at a keyframe */
+      this.needKey = false;
+    }
+    this.queue.push({ data, key });
+    this.pump();
   }
   setup(init) {
     this.teardown();
@@ -296,6 +310,9 @@ class LivePlayer {
     const ms = new MS();
     this.ms = ms;
     this.queue = [];
+    this.needKey = true;
+    this.gaps = [];
+    this.lastArrival = 0;
     this.initSeg = init;
     this.video.disableRemotePlayback = true;
     this.objectUrl = URL.createObjectURL(ms);
@@ -319,10 +336,16 @@ class LivePlayer {
   pump() {
     const sb = this.sb;
     if (!sb || sb.updating || !this.queue.length) return;
-    if (this.queue.length > 6) this.queue.splice(0, this.queue.length - 2);  /* tab was hidden: jump ahead */
+    if (this.queue.length > 30) {
+      /* far behind (hidden tab, slow device): skip ahead to the newest keyframe we have */
+      let k = -1;
+      for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].key) { k = i; break; }
+      if (k < 0) { this.queue = []; this.needKey = true; return; }
+      this.queue.splice(0, k);
+    }
     const seg = this.queue.shift();
     try {
-      sb.appendBuffer(seg);
+      sb.appendBuffer(seg.data);
     } catch (e) {
       if (e.name === "QuotaExceededError") {
         this.queue.unshift(seg);
@@ -333,17 +356,29 @@ class LivePlayer {
       }
     }
   }
+  /* How far behind the newest frame to play: enough to bridge the longest recent pause between
+     fragments (network jitter), so playback never runs dry - 0.3 s on a LAN, more on a shaky link. */
+  target() {
+    const g = this.gaps && this.gaps.length ? Math.max.apply(null, this.gaps) / 1000 : 0.5;
+    return Math.min(3, Math.max(0.3, g * 1.2 + 0.1));
+  }
   tick() {
     const v = this.video, sb = this.sb;
     if (!sb || !v.buffered.length) return;
     const n = v.buffered.length;
     const end = v.buffered.end(n - 1), lastStart = v.buffered.start(n - 1);
-    if (end - v.currentTime > 3.5 || v.currentTime < lastStart - 0.05 && n > 1 || v.currentTime < v.buffered.start(0)) {
-      v.currentTime = Math.max(lastStart, end - 0.8);
+    const target = this.target();
+    const lag = end - v.currentTime;
+    if (v.currentTime < lastStart - 0.05 || lag > target + 3) {
+      v.currentTime = Math.max(lastStart, end - target);   /* far behind or in an old range: jump */
+      v.playbackRate = 1;
+    } else if (!document.hidden) {
+      /* stay about `target` behind live by playing slightly faster or slower - no visible jumps */
+      v.playbackRate = lag > target + 0.15 ? Math.min(1.5, 1 + (lag - target) * 0.5) : (lag < target - 0.1 ? 0.95 : 1);
     }
     if (v.paused && !document.hidden) v.play().catch(() => {});
-    if (!sb.updating && v.currentTime - v.buffered.start(0) > 40) {
-      try { sb.remove(0, v.currentTime - 15); } catch (e) { /* ignore */ }
+    if (!sb.updating && v.currentTime - v.buffered.start(0) > 30) {
+      try { sb.remove(0, v.currentTime - 10); } catch (e) { /* ignore */ }
     }
   }
   teardown() {

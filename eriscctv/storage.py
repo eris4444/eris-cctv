@@ -236,6 +236,7 @@ class Recorder:
         self.init = None
         self.error = ""
         self.dropped = 0
+        self.gap = False
         self.written = 0
         self.paused_until = 0.0
         self.thread = threading.Thread(target=self._run, name="rec-" + cam.id, daemon=True)
@@ -244,13 +245,13 @@ class Recorder:
     # called from the event loop
     def on_init(self, cam, data: bytes) -> None:
         self.cam_name = cam.name
-        self._put(("init", data))
+        self._put(("init", data, False))
 
-    def on_frag(self, cam, data: bytes) -> None:
-        self._put(("frag", data))
+    def on_frag(self, cam, data: bytes, key: bool = True) -> None:
+        self._put(("frag", data, key))
 
     def close(self) -> None:
-        self._put(("stop", None), force=True)
+        self._put(("stop", None, False), force=True)
 
     def _put(self, item, force=False) -> None:
         try:
@@ -260,11 +261,12 @@ class Recorder:
                 self.q.put(item)
             else:
                 self.dropped += 1
+                self.gap = True  # the writer skips to the next keyframe
 
     # writer thread
     def _run(self) -> None:
         while True:
-            kind, data = self.q.get()
+            kind, data, key = self.q.get()
             if kind == "stop":
                 self._close()
                 return
@@ -274,9 +276,13 @@ class Recorder:
                 continue
             if self.init is None or time.time() < self.paused_until:
                 continue
+            if self.gap or self.file is None:
+                if not key:
+                    continue  # files and the picture after a gap start at a keyframe
+                self.gap = False
             try:
                 now = time.time()
-                if self.file is None or now >= self.rotate_at:
+                if self.file is None or (now >= self.rotate_at and key):
                     self._close()
                     self._open(now)
                 self.file.write(data)

@@ -45,6 +45,13 @@ def load_config(path: str = "") -> dict:
             # 1.0 had tls: true/false; "false" usually meant "the server had no TLS yet"
             s["tls_mode"] = "on" if s.get("tls") is True else "auto"
         s.pop("tls", None)
+    for cam in cfg["cameras"]:
+        # re-pick the capture format with today's rules (1.1 and older chose raw YUYV for HD, which a
+        # USB 2.0 webcam delivers at ~4 fps), unless someone set the format by hand
+        if cam.get("modes") and cam.get("width") and not cam.get("input_format_fixed"):
+            fmt, fps = devices.pick_input(cam["modes"], cam["width"], cam["height"], int(cam.get("fps") or 15))
+            if fmt != "auto":
+                cam["input_format"], cam["fps"] = fmt, fps or int(cam.get("fps") or 15)
     return cfg
 
 
@@ -74,11 +81,17 @@ def new_server_entry(address: str, port: int, username: str, password: str, tls_
 
 
 class LiveViewer:
-    """A browser watching one camera on the local panel."""
+    """A browser watching one camera on the local panel.
+
+    Messages: text = meta, then binary 1 = init, 2 = fragment, 3 = fragment starting with a keyframe.
+    A viewer starts at a keyframe and, after a fragment had to be dropped (slow browser), waits for the
+    next one, so the picture never decodes from missing data.
+    """
 
     def __init__(self):
-        self.q: asyncio.Queue = asyncio.Queue(maxsize=48)
+        self.q: asyncio.Queue = asyncio.Queue(maxsize=64)
         self.primed = False
+        self.need_key = True
 
     def _put(self, item, force=False):
         try:
@@ -93,10 +106,16 @@ class LiveViewer:
         self._put((0, json.dumps(meta(cam))), force=True)
         self._put((1, data), force=True)
         self.primed = True
+        self.need_key = True
 
-    def on_frag(self, cam, data):
-        if self.primed:
-            self._put((2, data))
+    def on_frag(self, cam, data, key=True):
+        if not self.primed or (self.need_key and not key):
+            return
+        try:
+            self.q.put_nowait((3 if key else 2, data))
+            self.need_key = False
+        except asyncio.QueueFull:
+            self.need_key = True
 
     def on_state(self, cam):
         if not cam.running:
@@ -651,6 +670,7 @@ class Agent:
             cam["bitrate"] = as_int(d["bitrate"], 0, 0, 20000)
         if "input_format" in d and d["input_format"]:
             cam["input_format"] = str(d["input_format"])
+            cam["input_format_fixed"] = d["input_format"] != "auto"
         elif "size" in d or "fps" in d:
             fmt, fps = devices.pick_input(modes, cam["width"], cam["height"], cam["fps"])
             cam["input_format"], cam["fps"] = fmt, fps or cam["fps"]

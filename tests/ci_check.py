@@ -67,7 +67,7 @@ async def watch(base, path, cookie, frags_wanted=4):
                 metas.append(json.loads(m))
             elif m[0] == 1:
                 init = m[1:]
-            elif m[0] == 2 and init:
+            elif m[0] in (2, 3) and init:
                 frags += 1
     finally:
         await ws.close()
