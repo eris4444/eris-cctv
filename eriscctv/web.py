@@ -492,6 +492,12 @@ class DualServer:
         if self._task:
             self._task.cancel()
         try:
+            # Python 3.8 leaves a cancelled sock_accept registered; a new socket that reuses the fd number
+            # would then never be polled
+            asyncio.get_event_loop().remove_reader(self.sock.fileno())
+        except (NotImplementedError, ValueError, OSError, RuntimeError):
+            pass
+        try:
             self.sock.close()
         except OSError:
             pass
