@@ -113,6 +113,37 @@ jobs:
         if: always()
         run: sudo tail -n 80 /var/log/eris-cctv/*.log || true
 
+  android:
+    name: Android camera app (core against the server, APK build)
+    runs-on: ubuntu-24.04
+    env:
+      ERIS_ALLOW_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Phone core (Kotlin on the JVM) against the real server
+        run: python android/tests/core_test.py
+      - name: Android SDK pieces
+        run: |
+          ls "$ANDROID_SDK_ROOT/build-tools" "$ANDROID_SDK_ROOT/platforms" || true
+          if [ ! -e "$ANDROID_SDK_ROOT/build-tools/34.0.0/lib/d8.jar" ] || [ ! -e "$ANDROID_SDK_ROOT/platforms/android-34/android.jar" ]; then
+            yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" "platforms;android-34" > /dev/null
+          fi
+      - name: Build the APK
+        run: ANDROID_SDK="$ANDROID_SDK_ROOT" python android/build.py apk --out apk/eris-cctv-camera.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eris-cctv-camera-apk
+          path: apk/eris-cctv-camera.apk
+
   webcam:
     name: Simulated USB webcam (v4l2loopback), ALSA microphone if the kernel has snd-aloop
     runs-on: ubuntu-24.04

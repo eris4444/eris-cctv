@@ -142,6 +142,30 @@ country (for example ArvanCloud) - or Cloudflare - and let the CDN carry the vid
 The camera system pins the CDN's certificate and follows its renewals automatically: a new
 certificate is accepted when a public CA vouches for it for that name; anything else is refused.
 
+## Android phone as a camera
+
+`android/` holds **Eris CCTV camera for Android** (Android 7.0+). A phone connects to the server exactly
+like a camera system: outgoing, encrypted automatically, with one of the server's camera accounts.
+
+- Back or front camera, 640x480 / 1280x720 / 1920x1080, 10-30 fps, quality, microphone on/off, rotation
+  (automatic from how the phone is held, or fixed).
+- Built for 24/7 on a charger: a foreground service with a wake lock and Wi-Fi lock keeps streaming with
+  the screen off, it restarts itself after errors and after the phone reboots, and the camera only turns
+  on while somebody watches (or always, if you prefer a faster start).
+- **Dark screen** (black, lowest brightness) and **Turn screen off** (locks the phone; needs a one-time
+  permission) buttons; the power button works too.
+- Preview, connection test, "Forget pinned certificate", battery level and temperature in the app.
+
+Build without Gradle (JDK 17, Android SDK build-tools 34 + platform 34, Kotlin 1.9.24 jars from the
+Gradle cache, or `ERIS_ALLOW_DOWNLOAD=1` to fetch them from Maven Central):
+
+```bash
+python android/build.py apk            # -> android/build/out/eris-cctv-camera.apk
+python android/tests/core_test.py      # the phone's protocol/MP4 code against the real server
+```
+
+The first build creates `android/release.jks`; keep it - app updates must be signed with the same key.
+
 ## Commands
 
 ```
@@ -230,6 +254,7 @@ upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webca
 
 ## Changes
 
+- **Android camera 1.0.0** - phones as cameras (see above).
 - **1.2.0** - Smooth, low-delay video. HD webcams capture in MJPEG at the webcam's own rate (raw YUYV
   1280x720 does not fit through USB 2.0 - a real webcam delivered 4 fps that way, ~15 with MJPEG);
   fragments of 2 frames (~130 ms) instead of one per second, so the delay drops from ~2 s to ~0.5 s;

@@ -3,3 +3,7 @@ __pycache__/
 .devhome/
 .claude/
 ffmpeg/
+android/build/
+android/.deps/
+android/release.jks
+android/keystore.properties

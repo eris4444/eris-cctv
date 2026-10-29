@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- App icon: a CCTV camera on a dark rounded square, green status light -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#0F1216" android:pathData="M24,6h60a18,18 0,0 1,18 18v60a18,18 0,0 1,-18 18h-60a18,18 0,0 1,-18 -18v-60a18,18 0,0 1,18 -18z" />
+    <path android:fillColor="#E7ECF2" android:pathData="M26,40h44a6,6 0,0 1,6 6v14a6,6 0,0 1,-6 6h-44a6,6 0,0 1,-6 -6v-14a6,6 0,0 1,6 -6z" />
+    <path android:fillColor="#E7ECF2" android:pathData="M76,48l12,-6v22l-12,-6z" />
+    <path android:fillColor="#8D97A5" android:pathData="M44,66h8v14h-8z" />
+    <path android:fillColor="#8D97A5" android:pathData="M34,78h28v6h-28z" />
+    <path android:fillColor="#0F1216" android:pathData="M38,53m-7,0a7,7 0,1 1,14 0a7,7 0,1 1,-14 0" />
+    <path android:fillColor="#36D399" android:pathData="M62,47m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
+</vector>
