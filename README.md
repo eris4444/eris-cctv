@@ -122,6 +122,26 @@ recordings. The agent starts in the background and starts again after a reboot.
 Open `http://SERVER-ADDRESS:8800` and sign in. To send the same cameras to another server, add it
 under **Servers** in the camera panel (or menu option 4).
 
+## Server behind a CDN (Iran and other throttled networks)
+
+Some networks throttle uploads to foreign servers whatever the protocol. Measured from an Iranian home
+line in 2026: to a VPS in the UK ~15 KB/s and the connection cut after 20-30 s, even with TLS; to a CDN
+edge inside the country 3 MB/s. Then let the camera systems upload to a CDN that has edges inside the
+country (for example ArvanCloud) - or Cloudflare - and let the CDN carry the video to the server:
+
+1. **DNS:** add a record for a new name (for example `cctv.example.ir`) with the server's IP and the
+   CDN / proxy switched **on**.
+2. **Origin port:** the CDN has to reach the server's port (default 8800). Set the record's origin /
+   upstream port to `8800` (Cloudflare: an Origin Rule). The server answers HTTP and HTTPS on that port,
+   so either upstream protocol works. If the CDN cannot use another port, change the server port to
+   `80` or `443` (menu: *Server: accounts, users and port* -> *Change the port*).
+3. Turn on **HTTPS** for that name in the CDN, and **WebSocket** support if the CDN has a switch for it.
+4. On every camera system (camera panel -> *Servers* -> *Edit*): address `cctv.example.ir`, port `443`.
+5. Watch at `https://cctv.example.ir`.
+
+The camera system pins the CDN's certificate and follows its renewals automatically: a new
+certificate is accepted when a public CA vouches for it for that name; anything else is refused.
+
 ## Commands
 
 ```
@@ -178,10 +198,11 @@ unencrypted link only for servers that never had TLS; `--server-tls` alone means
   reason (wrong password, connection refused, timeout, TLS problem). Make sure the server port is
   open in every firewall on the way.
 - **Server panel stays on "Starting video..." and the link reconnects every 20-50 s:** the network
-  throttles unencrypted uploads (seen on Iranian lines: plain uploads abroad crawl at ~5 KB/s and are
-  reset after ~20 s, while TLS runs at full speed). Update **both** the server and the camera system
-  to 1.1 or newer - the link then uses TLS automatically. The *Servers* page of the camera panel and
-  the *Camera systems* page of the server show "Encrypted" for every link.
+  throttles uploads abroad (seen on Iranian lines: plain uploads crawl at ~5 KB/s and are reset after
+  ~20 s). Update **both** the server and the camera system to 1.1 or newer - the link then uses TLS
+  automatically; the *Servers* page of the camera panel and the *Camera systems* page of the server
+  show "Encrypted" for every link. If an encrypted link still drops every 20-30 s, the network
+  throttles that server's address itself: put the server behind a CDN (see above).
 - **"The server's TLS certificate changed":** the server was reinstalled or got a new certificate.
   In the camera panel open *Servers -> Edit* and click *Forget pinned certificate*.
 - **Slow upload:** when the uplink is slower than the camera, the agent skips stale fragments so the
@@ -207,6 +228,8 @@ upgrade from 1.0 (unencrypted) to the current version, and a simulated USB webca
 
 ## Changes
 
+- **1.1.2** - Works behind a CDN (ArvanCloud, Cloudflare): a pinned certificate that is renewed and
+  valid for the name from a public CA is followed automatically. README: CDN setup.
 - **1.1.1** - A camera system that fell back to an unencrypted link (server still on 1.0) switches to
   TLS within seconds once that server is updated - update the camera systems and the server in any
   order.

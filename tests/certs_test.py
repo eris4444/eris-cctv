@@ -71,7 +71,56 @@ def main():
     cert, key = certs.make_self_signed("cctv.example.com")
     check(certs.usable(cert, key), "make_self_signed (%s) -> %s" % ("openssl" if shutil.which("openssl") else
                                                                      "pure Python", cert))
+    print("pinned certificate renewals (CDN / Let's Encrypt)")
+    asyncio.run(renewals())
     print("\nALL CERT CHECKS PASSED")
+
+
+async def renewals():
+    """A pinned server gets a new certificate: followed only if a CA vouches for it (like a CDN renewal)."""
+    from eriscctv.link import AuthError, open_ws
+    from eriscctv.web import HttpServer, make_server_ssl
+
+    def pair(name):
+        cert_pem, key_pem = certs.generate("localhost")
+        c, k = os.path.join(HOME, name + "-c.pem"), os.path.join(HOME, name + "-k.pem")
+        with open(c, "w") as f:
+            f.write(cert_pem)
+        with open(k, "w") as f:
+            f.write(key_pem)
+        return c, k
+
+    first, renewed, foreign = pair("first"), pair("renewed"), pair("foreign")
+    os.environ["ERIS_CCTV_CA_FILE"] = renewed[0]  # "the public CA" only vouches for the renewed one
+
+    async def serve(pem):
+        web = HttpServer()
+
+        async def agent_ws(req, sock):
+            await sock.recv()
+        web.websocket("/agent/ws")(agent_ws)
+        await web.start("127.0.0.1", 18999, make_server_ssl(*pem), also_plain=True)
+        return web
+
+    cfg = {"address": "localhost", "port": 18999, "tls_mode": "auto", "tls_verify": "pin", "tls_pin": ""}
+    for pem, label in ((first, "first contact"), (renewed, "renewed"), (foreign, "foreign")):
+        web = await serve(pem)
+        try:
+            if label == "foreign":
+                try:
+                    await open_ws(cfg)
+                    raise AssertionError("a certificate nobody vouches for was accepted")
+                except AuthError as e:
+                    check("changed" in str(e), "unknown new certificate refused: %s" % str(e)[:60])
+            else:
+                ws, fp, secure = await open_ws(cfg)
+                ws.abort()
+                cfg["tls_pin"] = cfg["tls_pin"] or fp
+                check(secure and cfg["tls_pin"] == certs.fingerprint_file(pem[0]),
+                      "%s: connected with TLS, pin = this certificate" % label)
+        finally:
+            await web.stop()
+    del os.environ["ERIS_CCTV_CA_FILE"]
 
 
 if __name__ == "__main__":

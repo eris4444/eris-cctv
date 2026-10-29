@@ -6,6 +6,7 @@ import collections
 import hashlib
 import json
 import logging
+import os
 import secrets
 import socket
 import ssl
@@ -42,7 +43,8 @@ def cert_fingerprint(der: bytes) -> str:
 
 def client_ssl(verify: str):
     if verify == "ca":
-        return ssl.create_default_context()
+        # ERIS_CCTV_CA_FILE: trust this CA bundle instead of the system's (tests, private CAs)
+        return ssl.create_default_context(cafile=os.environ.get("ERIS_CCTV_CA_FILE") or None)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -96,9 +98,20 @@ async def _open_tls(cfg: dict, timeout: float):
     fp = cert_fingerprint(der or b"")
     if verify == "pin" and cfg.get("tls_pin") and not same(fp, cfg["tls_pin"]):
         ws.abort()
-        raise AuthError("The server's TLS certificate changed (expected %s..., got %s...). If you reinstalled "
-                        "the server, open this server in the camera panel and choose \"Forget pinned "
-                        "certificate\"." % (cfg["tls_pin"][:16], fp[:16]))
+        # A CDN (ArvanCloud, Cloudflare) or Let's Encrypt renews its certificate every few months. A new
+        # certificate that a public CA vouches for, for this very name, is followed; anything else is refused.
+        try:
+            ws = await connect(cfg["address"], int(cfg["port"]), AGENT_PATH, ssl_ctx=client_ssl("ca"),
+                               timeout=timeout)
+        except ssl.SSLCertVerificationError:
+            raise AuthError("The server's TLS certificate changed (expected %s..., got %s...). If you reinstalled "
+                            "the server, open this server in the camera panel and choose \"Forget pinned "
+                            "certificate\"." % (cfg["tls_pin"][:16], fp[:16]))
+        der = ws.writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
+        fp = cert_fingerprint(der or b"")
+        log.info("server %s:%s renewed its publicly trusted certificate - pin updated to %s...",
+                 cfg["address"], cfg["port"], fp[:16])
+        cfg["tls_pin"] = fp
     return ws, fp
 
 
@@ -295,14 +308,17 @@ class ServerLink:
 
     async def _session(self) -> None:
         plain_first = time.monotonic() < self._plain_until
+        pin_before = self.cfg.get("tls_pin", "")
         ws, fp, secure = await open_ws(self.cfg, plain_first=plain_first)
         self.ws, self.secure = ws, secure
         if not secure and tls_mode(self.cfg) == "auto":
             self._plain_until = time.monotonic() + PLAIN_RETRY_TLS
         welcome = await handshake(ws, self.cfg, self.agent.agent_id, self.agent.name, self._key_cache)
-        if secure and self.cfg.get("tls_verify", "pin") == "pin" and not self.cfg.get("tls_pin"):
-            self.cfg["tls_pin"] = fp  # trust on first use, only after the server proved the password
-            self.agent.save()
+        if secure and self.cfg.get("tls_verify", "pin") == "pin":
+            if not self.cfg.get("tls_pin"):
+                self.cfg["tls_pin"] = fp  # trust on first use, only after the server proved the password
+            if self.cfg["tls_pin"] != pin_before:
+                self.agent.save()
         self.server_tls = bool(welcome.get("tls")) or secure
         if self.server_tls and not secure and tls_mode(self.cfg) == "auto":
             self._plain_until = 0.0
